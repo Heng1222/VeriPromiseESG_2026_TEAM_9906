@@ -3,10 +3,13 @@ import json
 import time
 from openai import OpenAI
 from tqdm import tqdm
+import os
 
 # 1. 初始化設定
 # 請填入你的 OpenAI API Key
-client = OpenAI(api_key="sk-your-openai-api-key") 
+API_KEY = os.getenv("API_KEY")  # 從環境變數讀取 API Key，確保安全性
+
+client = OpenAI(api_key=API_KEY)
 INPUT_CSV = "train_data.csv"       # 原始 1000 筆資料的路徑
 OUTPUT_CSV = "augmented_misleading_data.csv" # 輸出的擴充資料路徑
 
