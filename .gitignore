@@ -1,6 +1,7 @@
 ### ===========
 /app/data/vpesg4k_train_1000 V1.csv
 /app/data/clean_data
+/app/data/analysis_results
 ### ===========
 # Byte-compiled / optimized / DLL files
 __pycache__/
