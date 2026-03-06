@@ -4,14 +4,16 @@ import time
 from openai import OpenAI
 from tqdm import tqdm
 import os
+from dotenv import load_dotenv
 
 # 1. 初始化設定
 # 請填入你的 OpenAI API Key
-API_KEY = os.getenv("API_KEY")  # 從環境變數讀取 API Key，確保安全性
-
+load_dotenv()
+API_KEY = os.getenv("API_KEY")  # 從 .env 檔案讀取 API Key
+print(API_KEY)
 client = OpenAI(api_key=API_KEY)
-INPUT_CSV = "train_data.csv"       # 原始 1000 筆資料的路徑
-OUTPUT_CSV = "augmented_misleading_data.csv" # 輸出的擴充資料路徑
+INPUT_CSV = "ori_data/vpesg4k_train_1000 V1.csv"       # 原始 1000 筆資料的路徑
+OUTPUT_CSV = "ori_data/augmented_misleading_data.csv" # 輸出的擴充資料路徑
 
 # 2. 定義 Prompt 模板
 SYSTEM_PROMPT = """你現在是一位頂尖的 ESG 審計專家，深諳企業「漂綠（Greenwashing）」技巧。
@@ -23,7 +25,7 @@ JSON 欄位必須完全對齊：["data", "promise_string", "evidence_string"]
 
 def build_user_prompt(row):
     return f"""
-    請根據以下真實樣本，生成 3 組不同特徵的 Misleading 擴寫樣本：
+    請根據以下真實樣本，生成 1 組不同特徵的 Misleading 擴寫樣本：
     ESG 類型: {row['esg_type']}
     原始文本: {row['data']}
     承諾語句: {row['promise_string']}
@@ -31,17 +33,17 @@ def build_user_prompt(row):
     """
 
 # 3. 呼叫 LLM 的核心函數 (具備容錯機制)
-def generate_misleading_samples(row, max_retries=3):
+def generate_misleading_samples(row, max_retries=1):
     for attempt in range(max_retries):
         try:
             response = client.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-5.1",
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": build_user_prompt(row)}
                 ],
                 response_format={ "type": "json_object" }, # 強制 JSON 輸出
-                temperature=0.7
+                temperature=1
             )
             
             # 解析 JSON
@@ -63,7 +65,7 @@ def main():
     # 篩選高品質的 Clear 樣本作為擴寫基底 (假設挑選 25 筆，即可生成 75 筆 Misleading)
     # 過濾條件：包含證據、且證據清晰、且文字長度大於一定字數避免太短的無意義句
     seed_samples = df[(df['evidence_quality'] == 'Clear') & 
-                      (df['evidence_status'] == 'Yes')].sample(n=25, random_state=42)
+                      (df['evidence_status'] == 'Yes')].sample(n=100, random_state=42)
     
     augmented_rows = []
     synthetic_id_counter = 90001 # 給予合成資料獨立的 ID 區段

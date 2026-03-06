@@ -4,10 +4,10 @@ from sklearn.model_selection import StratifiedKFold
 import os
 
 # 1. 初始化設定
-REAL_DATA_PATH = "train_data.csv"                  # 官方 1000 筆真實資料
-SYNTHETIC_DATA_PATH = "augmented_misleading_data.csv"  # Phase A 生成的擴充資料
+REAL_DATA_PATH = "ori_data/vpesg4k_train_1000 V1.csv"                  # 官方 1000 筆真實資料
+SYNTHETIC_DATA_PATH = "ori_data/augmented_misleading_data.csv"  # Phase A 生成的擴充資料
 N_SPLITS = 5
-OUTPUT_DIR = "./folds_data/"
+OUTPUT_DIR = "./clean_data/"
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
