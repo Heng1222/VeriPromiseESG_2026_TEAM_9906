@@ -130,8 +130,8 @@ def compare_results(file1, file2):
             results[col] = None
             continue
 
-        y_true = df_eval[true_col].astype(str)
-        y_pred = df_eval[pred_col].astype(str)
+        y_true = df_merged[true_col].fillna("N/A")
+        y_pred = df_merged[pred_col].fillna("N/A")
 
         score = f1_score(y_true, y_pred, average="weighted")
         results[col] = score
@@ -157,7 +157,7 @@ def main():
     # 手動指定檔案
     file1 = "../data/clean_data/val_fold_1.csv"  # 真實標籤
     file2 = "../../final_submission.csv"
-
+    
     compare_results(file1, file2)
 
 
