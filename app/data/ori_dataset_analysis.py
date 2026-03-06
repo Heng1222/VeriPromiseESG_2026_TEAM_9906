@@ -133,5 +133,5 @@ if __name__ == "__main__":
     # 設定中文顯示
     plt.rcParams['font.sans-serif'] = ['Microsoft JhengHei', 'SimHei'] # 優先使用微軟正黑體, 備用簡體黑體
     plt.rcParams['axes.unicode_minus'] = False  # 解決負號顯示問題
-    file_name = "vpesg4k_train_1000 V1.csv"
+    file_name = "ori_data/vpesg4k_train_1000 V1.csv"
     analyze_dataset(file_name)
