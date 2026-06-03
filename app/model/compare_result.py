@@ -11,6 +11,13 @@ TARGET_COLUMNS = [
     "evidence_quality",
 ]
 
+COMPETITION_SCORE_WEIGHTS = {
+    "promise_status": 0.20,
+    "evidence_status": 0.30,
+    "evidence_quality": 0.35,
+    "verification_timeline": 0.15,
+}
+
 MISSING_ALLOWED_COLUMNS = [
     "verification_timeline",
     "evidence_status",
@@ -99,9 +106,10 @@ def compare_results(file1, file2):
         if only_in_file2:
             print(f"只存在於 file2 的 id（前 10 筆）: {only_in_file2[:10]}")
 
-    print("\n--- 各欄位 Weighted F1 Score ---")
+    print("\n--- 各欄位 F1 Score ---")
 
     results = {}
+    macro_results = {}
 
     for col in TARGET_COLUMNS:
         true_col = f"{col}_true"
@@ -128,15 +136,19 @@ def compare_results(file1, file2):
         if valid_count == 0:
             print("無可用資料，無法計算 F1 Score")
             results[col] = None
+            macro_results[col] = None
             continue
 
-        y_true = df_merged[true_col].fillna("N/A")
-        y_pred = df_merged[pred_col].fillna("N/A")
+        y_true = df_eval[true_col].fillna("N/A")
+        y_pred = df_eval[pred_col].fillna("N/A")
 
-        score = f1_score(y_true, y_pred, average="weighted")
-        results[col] = score
+        weighted_score = f1_score(y_true, y_pred, average="weighted")
+        macro_score = f1_score(y_true, y_pred, average="macro", zero_division=0)
+        results[col] = weighted_score
+        macro_results[col] = macro_score
 
-        print(f"Weighted F1 Score: {score:.4f}")
+        print(f"Weighted F1 Score: {weighted_score:.4f}")
+        print(f"Macro F1 Score: {macro_score:.4f}")
 
     valid_scores = [score for score in results.values() if score is not None]
 
@@ -153,10 +165,30 @@ def compare_results(file1, file2):
     else:
         print("Average Weighted F1 Score: N/A")
 
+    print("\n--- Competition Macro-F1 Score ---")
+    competition_score = 0.0
+    missing_cols = []
+
+    for col, weight in COMPETITION_SCORE_WEIGHTS.items():
+        score = macro_results.get(col)
+        if score is None:
+            missing_cols.append(col)
+            print(f"{col}: N/A * {weight:.2f}")
+            continue
+
+        weighted_component = score * weight
+        competition_score += weighted_component
+        print(f"{col}: {score:.4f} * {weight:.2f} = {weighted_component:.4f}")
+
+    if missing_cols:
+        print(f"Competition Score: N/A, missing macro F1 for {missing_cols}")
+    else:
+        print(f"Competition Score: {competition_score:.4f}")
+
 def main():
     # 手動指定檔案
-    file1 = "../data/clean_data/val_fold_1.csv"  # 真實標籤
-    file2 = "../../final_submission.csv"
+    file1 = "../data/ori_data/vpesg4k_val_1000.csv"  # 真實標籤
+    file2 = "../../final_submission_val.csv"
     
     compare_results(file1, file2)
 
