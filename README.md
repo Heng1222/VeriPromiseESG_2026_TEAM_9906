@@ -62,18 +62,32 @@ VeriPromiseESG_2026_TEAM_9906/
 - 使用 5-fold 訓練與 fold soft-voting 推論。
 - 使用固定 routing 產生 `final_submission.csv`。
 
+`model_inference.ipynb` 只支援原始 Transformer MTL artifact：
+
+```text
+best_mtl_model_fold_1.pth
+...
+best_mtl_model_fold_5.pth
+tokenizer/
+```
+
+它不會讀取 SetFit 的 `encoder/` 或 `task_heads.joblib`，因此 SetFit 模型必須使用 `model_setfit_inference.ipynb`。
+
 ### Multi-Task SetFit
 
 SetFit 訓練流程位於 `app/model/model_setfit.ipynb`。SetFit 推論流程位於 `app/model/model_setfit_inference.ipynb`。
 
 核心設計：
 
-- 預設 pre-trained model 使用 `BAAI/bge-large-zh-v1.5`。
-- 若 GPU 記憶體不足，可在 notebook 設定 `FORCE_FALLBACK_MODEL = True`，改用 `BAAI/bge-base-zh-v1.5`。
+- 預設 pre-trained model 使用 `BAAI/bge-base-zh-v1.5`。
 - 使用 SetFit-style contrastive learning fine-tune 共享 SentenceTransformer encoder。
 - T1-T4 共用同一個 embedding space，但保留四個 task-specific heads。
 - 訓練時加入 task prefix，避免不同任務的 `Yes` / `No` 標籤互相混淆。
 - synthetic `Misleading` 只用於 T4 head 與 T4 contrastive view，不用來強化 T1-T3。
+- encoder 最多訓練 10 epochs，每個 epoch 使用固定 validation pairs 計算 cosine average precision。
+- validation pairs 不含 synthetic data，也不使用 model-dependent hard-negative mining。
+- validation cosine AP 連續 2 次沒有至少 `0.0001` 的改善時提前停止。
+- 訓練完成後自動載入並保存 validation cosine AP 最佳的 encoder，而不是最後一個 epoch。
 - 在 OOF validation 上搜尋 T1/T3 threshold，以最大化四個任務的平均 macro F1。
 
 `model_setfit.ipynb` 會輸出：
@@ -92,6 +106,26 @@ setfit_outputs/
 `-- fold_5/
     |-- encoder/
     `-- task_heads.joblib
+```
+
+Early-stopping checkpoint 只會暫存在訓練期間，完成後自動刪除。正式 artifact 路徑與既有 inference 契約不變：
+
+- 最佳 encoder：`setfit_outputs/fold_{fold}/encoder/`
+- task heads：`setfit_outputs/fold_{fold}/task_heads.joblib`
+- thresholds：`setfit_outputs/setfit_thresholds.json`
+- inference config：`setfit_outputs/setfit_inference_config.json`
+
+### Choose The Correct Inference Notebook
+
+| 訓練流程 | 推論 notebook | 模型 artifact |
+|---|---|---|
+| Original Transformer MTL | `app/model/model_inference.ipynb` | `best_mtl_model_fold_{fold}.pth`、`tokenizer/` |
+| Multi-Task SetFit | `app/model/model_setfit_inference.ipynb` | `fold_{fold}/encoder/`、`fold_{fold}/task_heads.joblib` |
+
+兩條流程都接受至少包含 `id,data,esg_type` 的 CSV，並輸出相同欄位順序：
+
+```text
+id,promise_status,verification_timeline,evidence_status,evidence_quality
 ```
 
 ## End-To-End Workflow
@@ -188,11 +222,17 @@ USE_GITHUB_RAW = False
 USE_GITHUB_RAW = True
 ```
 
-若 GPU 記憶體不足，設定：
+目前 primary 與 fallback model 都設定為 `BAAI/bge-base-zh-v1.5`。如需更換 encoder，請同時確認 Colab GPU 記憶體與 SentenceTransformer 相容性。
+
+encoder 訓練的防 overfitting 設定如下：
 
 ```python
-FORCE_FALLBACK_MODEL = True
+CONTRASTIVE_EPOCHS = 10
+EARLY_STOPPING_PATIENCE = 2
+EARLY_STOPPING_THRESHOLD = 0.0001
 ```
+
+每個 fold 都會顯示 training loss、validation loss、validation cosine AP、最佳 epoch 與實際停止 epoch。只有最佳 encoder 會寫入正式 artifact 目錄。
 
 依序執行 notebook。訓練完成後會產生：
 
@@ -263,6 +303,8 @@ DEFAULT_REPO_ID = "maxbeettww/VeriPromise_ESG_2026_9906_SetFit"
 5. 套用 `setfit_thresholds.json` 的 T1/T3 threshold。
 6. 使用原本 routing 輸出 `final_submission.csv`。
 
+Early stopping 不會改變任何 inference 輸入或 artifact schema，因此不需要修改 `model_setfit_inference.ipynb`，重新訓練後可直接載入新的最佳 encoder。
+
 測試 CSV 至少需要包含：
 
 ```text
@@ -307,6 +349,7 @@ setfit_final_submission.csv
 - 不建議把 T1-T4 合成單一 joint label classifier，因為正式輸出與評估是四個獨立欄位。
 - 目前採用折衷設計：共享 SetFit encoder，加上四個 task-specific heads。
 - SetFit inference notebook 的輸入/輸出格式與原本 `model_inference.ipynb` 一致。
+- `model_inference.ipynb` 與 `model_setfit_inference.ipynb` 的模型 artifact 不相容，請依訓練流程選擇對應 notebook。
 
 ---
 
