@@ -4,7 +4,10 @@ from sklearn.model_selection import StratifiedKFold
 import os
 
 # 1. 初始化設定
-REAL_DATA_PATH = "ori_data/vpesg4k_train_1000 V1.csv"                  # 官方 1000 筆真實資料
+REAL_DATA_PATH = [
+    "ori_data/vpesg4k_train_1000 V1.csv",
+    "ori_data/vpesg4k_val_1000.csv",
+]
 SYNTHETIC_DATA_PATH = "ori_data/augmented_misleading_data.csv"  # Phase A 生成的擴充資料
 N_SPLITS = 5
 OUTPUT_DIR = "./clean_data/"
@@ -36,7 +39,11 @@ def create_proxy_stratify_key(df):
 
 def main():
     print("讀取真實資料與擴充資料...")
-    real_df = pd.read_csv(REAL_DATA_PATH)
+    real_df = pd.concat(
+        [pd.read_csv(data_path) for data_path in REAL_DATA_PATH],
+        axis=0,
+        ignore_index=True,
+    )
     synth_df = pd.read_csv(SYNTHETIC_DATA_PATH)
     
     # 重置 Index 以策安全，避免 iloc 對應錯誤
