@@ -604,11 +604,12 @@ def calculate_mtl_loss(model, logits, features, batch, class_weights):
         )
 
     pair_loss = zero
-    pair_valid = batch["pair_valid"].to(DEVICE)
-    if pair_valid.any():
+    pair_valid_cpu = batch["pair_valid"].bool()
+    if pair_valid_cpu.any():
+        pair_valid = pair_valid_cpu.to(DEVICE)
         pair_features = model.encode(
-            batch["pair_input_ids"][pair_valid].to(DEVICE),
-            batch["pair_attention_mask"][pair_valid].to(DEVICE),
+            batch["pair_input_ids"][pair_valid_cpu].to(DEVICE),
+            batch["pair_attention_mask"][pair_valid_cpu].to(DEVICE),
         )
         similarity = F.cosine_similarity(features[pair_valid], pair_features)
         pair_loss = F.relu(similarity - PAIR_COSINE_MARGIN).mean()

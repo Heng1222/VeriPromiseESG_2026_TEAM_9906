@@ -235,6 +235,14 @@ class CKIPLoraNotebookTests(unittest.TestCase):
         self.assertIn("use_rslora=True", train_source)
         self.assertIn("assert_save_load_parity", train_source)
         self.assertIn("FULL_DATA_SEEDS = [42, 123, 2026]", train_source)
+        self.assertIn(
+            'pair_valid_cpu = batch[\\"pair_valid\\"].bool()',
+            train_source,
+        )
+        self.assertIn(
+            'batch[\\"pair_input_ids\\"][pair_valid_cpu]',
+            train_source,
+        )
 
 
 if __name__ == "__main__":
