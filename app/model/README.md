@@ -1,107 +1,199 @@
 # Model
 
-此目錄包含 VeriPromiseESG 的模型訓練、推論與評估程式。
+此目錄包含 VeriPromiseESG 的模型訓練、推論、評估與 notebook 產生工具。
 
 ## Notebooks
 
 | 檔案 | 用途 | 模型 artifact |
 |---|---|---|
-| `model_train.ipynb` | CKIP-BERT multi-task 5-fold fine-tuning 與 OOF 評估 | `mtl_outputs/` |
-| `model_inference.ipynb` | CKIP-BERT 5-fold probability ensemble 推論 | `mtl_outputs/` 或 Hugging Face repo |
-| `model_setfit.ipynb` | Multi-Task SetFit 5-fold 訓練與 OOF 評估 | encoder、task heads、thresholds |
+| `model_train.ipynb` | CKIP-BERT RSLoRA multi-task 訓練、5-fold OOF 校準與 full-data ensemble | `mtl_outputs/`，artifact v3 |
+| `model_inference.ipynb` | CKIP-BERT v3 ensemble 推論，並相容舊版 v1/v2 checkpoint | `mtl_outputs/` 或 Hugging Face repo |
+| `model_setfit.ipynb` | Multi-Task SetFit 5-fold 訓練與 OOF 評估 | `setfit_outputs/` |
 | `model_setfit_inference.ipynb` | SetFit 5-fold soft-voting 推論 | `setfit_outputs/` 或 Hugging Face repo |
 
 CKIP-BERT 與 SetFit 的外部 CSV 介面相同，但 artifact 不相容，必須使用各自對應的 inference notebook。
 
-## Input And Output Compatibility
+## Input And Output
 
-CKIP-BERT 與 SetFit 都不會改變外部輸入或提交格式。
+### Training Data
 
-### Training Input
-
-`model_train.ipynb` 與 `model_setfit.ipynb` 都讀取：
+新版 `model_train.ipynb` 讀取：
 
 ```text
-app/data/clean_data/train_fold_1.csv
-...
-app/data/clean_data/train_fold_5.csv
+app/data/ori_data/vpesg4k_train_1000 V1.csv
+app/data/ori_data/vpesg4k_val_1000.csv
+app/data/ori_data/augmented_misleading_data.csv
 app/data/clean_data/val_fold_1.csv
 ...
 app/data/clean_data/val_fold_5.csv
 ```
 
-訓練資料必須包含：
+兩份官方 labeled data 合併為 2,000 筆真實資料。`val_fold_*.csv` 只用來取得既有 fold ID，不直接當成另一份資料加入。111 筆 synthetic `Misleading` 資料只參與 T4 與 paired contrastive loss。
+
+必要欄位：
 
 ```text
 id,data,promise_status,verification_timeline,evidence_status,evidence_quality
 ```
 
-其他欄位如 `esg_type`、`company`、`page_number` 可以保留，但兩套模型都只要求 `data` 作為文字輸入，不依賴測試資料中的額外欄位。
+Synthetic 配對使用 `pdf_url` 與 `promise_string`；source group 則使用 `pdf_url` 與 `page_number`。目前 111 筆中有 105 筆可配回原始 Clear 樣本；37 個 synthetic source groups 會完整分配到單一 fold，避免同來源變體同時出現在訓練與 auxiliary validation。
 
 ### Inference Input
 
-`model_inference.ipynb` 與 `model_setfit_inference.ipynb` 的測試 CSV 最少只要求：
+`model_inference.ipynb` 最少只要求：
 
 ```text
 id,data
 ```
 
 - `id` 不可重複。
-- `esg_type` 可以存在，但目前不會加入模型輸入。
-- 輸入列數與 `id` 順序會原樣保留。
+- 其他欄位可以存在，但不會加入模型輸入。
+- 輸出列數與 `id` 順序和輸入完全一致。
 
 ### Prediction Output
-
-輸出欄位與順序維持不變：
 
 ```text
 id,promise_status,verification_timeline,evidence_status,evidence_quality
 ```
 
-Routing 規則也維持不變：
+Routing 規則：
 
 - `promise_status=No` 時，T2、T3、T4 輸出 `N/A`。
 - `promise_status=Yes` 且 `evidence_status=No` 時，T4 輸出 `N/A`。
-- T2 的正式標籤使用 `longer_than_5_years`；舊資料中的 `more_than_5_years` 會在訓練時正規化。
+- 官方 T2 長期標籤是 `more_than_5_years`。
+- 新版 CKIP-BERT inference 會把舊資料或舊 artifact 中的 `longer_than_5_years` 轉成官方值後匯出。
 
-獨立 inference notebook 預設輸出 `final_submission.csv`，兩套模型的 CSV schema 相同。
+輸出前會檢查欄位順序、合法標籤、routing、列數與 ID 順序。預設輸出檔名為 `final_submission.csv`。
 
-## CKIP-BERT Fine-Tuning
+## CKIP-BERT LoRA Training
 
-`model_train.ipynb` 保留共享 CKIP-BERT backbone、四個既有 MLP heads，以及 masked BCE/CE loss。主要改善集中在訓練與模型選擇，不建立 SetFit pairs，也不增加新文字：
+### Model
 
-- Backbone 與 tokenizer 統一使用 `ckiplab/bert-base-chinese`。
-- 只使用 `data`，訓練與推論共用相同的 head-tail token truncation。
-- 五個 folds 各訓練一個 encoder；每個 fold 只保留 validation competition macro-F1 最高的 epoch。
-- Competition 權重固定為 T1 `0.20`、T2 `0.15`、T3 `0.30`、T4 `0.35`。
-- Backbone 與 heads 使用不同 learning rate，並加入 warmup、cosine decay、gradient clipping、AMP、gradient accumulation 與 early stopping。
-- T1-T4 使用平方根反頻率 class weights，降低 T2 `within_2_years` 與 T4 `Misleading` 的類別不平衡影響。
-- 既有 synthetic `Misleading` rows 只計入 T4，sample weight 固定為 `0.35`，不再污染 T1-T3。
-- 完成五 folds 後，以 2,000 筆 OOF probabilities 搜尋 T1/T3 routing thresholds。
-- 推論時先對五個 folds 的 probabilities 做平均，再套用 thresholds 與階層 routing。
+- Backbone：`ckiplab/bert-base-chinese`。
+- 使用 PEFT RSLoRA，套用所有 Transformer linear layers。
+- LoRA 設定：`r=8`、`alpha=16`、dropout `0.1`、`use_rslora=True`。
+- 文字只使用 `data`，訓練與推論共用 head-tail truncation，最大長度 512。
+- Pooling：`CLS + masked mean + masked max`，合併後維度為 2304。
+- Shared MLP：`2304 -> 384 -> 256`。
+- 四個 task heads：`256 -> 128 -> output`，全部使用 multi-sample dropout。
 
-這個設計仍保留 validation。直接用全部 2,000 筆訓練而完全不驗證，無法選 epoch、threshold 或偵測過擬合；五個 fold 的 ensemble 則能讓每筆訓練資料參與四個模型，同時保留完整 OOF 評估。
+### Objectives
 
-### CKIP-BERT Artifacts
+- T1-T4 使用 effective-number class-balanced focal loss，`gamma=1.5`，class weight 上限為 6。
+- Competition task weights：
+  - T1 `0.20`
+  - T2 `0.15`
+  - T3 `0.30`
+  - T4 `0.35`
+- T2 額外加入權重 `0.15` 的 ordinal expected-distance loss。
+- Synthetic T4 sample weight 為 `0.25`。
+- 可配對的 synthetic/原始 Clear 樣本加入權重 `0.05` 的 cosine-margin loss。
+- Synthetic rows 不參與 T1-T3 loss。
+
+### Optimization
+
+- LoRA learning rate：`1e-4`。
+- Shared MLP 與 task heads learning rate：`3e-4`。
+- Batch size 8，gradient accumulation 2，effective batch size 16。
+- 最多 12 epochs，early stopping patience 3。
+- Warmup 10%、cosine decay、AMP 與 gradient clipping 1.0。
+
+## Training Flow
+
+### 1. Five-Fold OOF
+
+每個 fold：
+
+1. 使用約 1,600 筆真實資料與四份 synthetic source groups 訓練。
+2. 使用 400 筆真實 validation 選擇 competition macro-F1 最佳 epoch。
+3. 保留一份 synthetic source groups 作 auxiliary holdout。
+4. 儲存 LoRA adapter、MLP heads、training history 與 OOF logits。
+
+完成五 folds 後：
+
+- 使用 OOF logits 為四個任務分別估計 scalar temperature。
+- T1/T3 threshold 以 `mean fold score - 0.25 * fold std` 為搜尋目標。
+- `Misleading` 同時使用 probability threshold 與相對於 Clear/Not Clear 的 margin。
+- `Misleading` threshold 必須令真實非 Misleading OOF false-positive rate 不超過 0.5%，再最大化 synthetic holdout recall。
+
+### 2. Full-Data Ensemble
+
+- 取五個 fold 最佳 epoch 的中位數作 full-data 訓練 epoch。
+- 使用全部 2,000 筆真實資料與 111 筆 synthetic 資料。
+- 分別使用 seeds `42`、`123`、`2026` 訓練三個模型。
+- 最終 v3 inference 只平均這三個 full-data members 的 calibrated probabilities。
+- 每個 member 儲存後會重新載入，執行 logits save/load parity 檢查。
+
+## Validation And Quality Gate
+
+訓練 notebook 會輸出：
+
+- Overall OOF competition score。
+- 官方 train 1,000、官方 val 1,000 與每個 fold 的 task macro F1。
+- Per-class classification report、confusion matrix 與 prediction distribution。
+- T4 direct/routed macro F1。
+- 兩筆真實 `Misleading` 的 probabilities 與 prediction。
+- Synthetic holdout recall 與真實非 Misleading false-positive rate。
+
+Quality gate 基準來自舊版 OOF：
+
+| 指標 | 基準 |
+|---|---:|
+| Competition | `0.601140` |
+| T1 | `0.754363` |
+| T2 | `0.565558` |
+| T3 | `0.724977` |
+| T4 | `0.422687` |
+
+要求：
+
+- Competition 不得低於 `0.601140`。
+- T1、T2、T3 不得比各自基準下降超過 `0.02`。
+- T4 必須改善，或維持基準且降低 `Misleading` false-positive rate。
+- Quality gate 失敗時 notebook 會停止，不會進入 full-data ensemble 與 artifact upload。
+
+目前 repository 只完成程式、靜態測試與資料契約驗證；新版 GPU 訓練尚未執行，因此沒有新版實際 F1。
+
+## CKIP-BERT Artifact V3
 
 ```text
 mtl_outputs/
 |-- fold_1/
-|   |-- best_model.pth
+|   |-- adapter/
+|   |-- heads.pt
+|   |-- metadata.json
 |   `-- training_history.csv
 |-- ...
 |-- fold_5/
-|   |-- best_model.pth
+|-- full_seed_42/
+|   |-- adapter/
+|   |-- heads.pt
+|   |-- metadata.json
 |   `-- training_history.csv
+|-- full_seed_123/
+|-- full_seed_2026/
 |-- tokenizer/
 |-- mtl_inference_config.json
+|-- mtl_calibration.json
 |-- mtl_thresholds.json
+|-- mtl_oof_logits.csv
 |-- mtl_oof_probabilities.csv
 |-- mtl_oof_predictions.csv
+|-- mtl_synthetic_holdout_logits.csv
 `-- training_history.csv
 ```
 
-本機推論：
+`mtl_inference_config.json` 會記錄：
+
+- artifact version 與 base model。
+- 三個 ensemble members。
+- LoRA、pooling 與 task class 設定。
+- temperatures、routing thresholds 與 `Misleading` thresholds。
+- quality metrics 與 synthetic policy。
+
+## CKIP-BERT Inference
+
+本機 artifact：
 
 ```python
 ensemble_inference_and_export(
@@ -116,76 +208,68 @@ Hugging Face artifact：
 
 ```python
 ensemble_inference_and_export(
-    repo_id="maxbeettww/VeriPromise_ESG_2026_9906_CKIP_MTL",
+    repo_id="maxbeettww/VeriPromise_ESG_2026_9906",
     test_csv_path="/content/test.csv",
     output_csv_path="final_submission.csv",
 )
 ```
 
-## Updated SetFit Training
+Inference notebook 支援：
 
-`model_setfit.ipynb` 只使用一組固定設定，最多訓練五個 shared encoders，每個 fold 一次，不執行多組 encoder 實驗。
+- v3：下載並 ensemble 三個 LoRA full-data members。
+- v1/v2：沿用舊版五個 full checkpoint probability ensemble。
+- 遠端 artifact 會先讀取 config 判斷版本；v3 不會下載同 repo 中的大型 legacy checkpoints。
 
-### Shared Encoder
+上傳前在 training notebook 將：
 
-- Backbone：`BAAI/bge-base-zh-v1.5`
+```python
+RUN_HF_UPLOAD = True
+```
+
+預設為 `False`，避免訓練完成前覆寫既有 Hugging Face artifact。
+
+## Notebook Maintenance And Tests
+
+兩個 CKIP-BERT notebook 由可 review 的 Python 來源產生：
+
+```powershell
+uv run python app/model/build_ckip_lora_notebooks.py
+```
+
+修改產生器後必須重新執行，將內容同步到 `.ipynb`。
+
+核心 contract 測試：
+
+```powershell
+uv run python -m unittest app.model.test_ckip_lora_notebooks -v
+```
+
+測試涵蓋：
+
+- Notebook code cell 語法。
+- Artifact v3 關鍵設定。
+- 官方 timeline alias。
+- T1/T3/T4 routing。
+- `Misleading` probability + margin 決策。
+- Submission schema 與合法值。
+- 37 個 synthetic source groups 的 fold 隔離。
+- 105 筆 synthetic/source 配對。
+
+## SetFit
+
+`model_setfit.ipynb` 與 `model_setfit_inference.ipynb` 維持既有 artifact v2 流程：
+
+- Backbone：`BAAI/bge-base-zh-v1.5`。
 - T1-T4 共用 SentenceTransformer encoder。
-- 最多 8 epochs，batch size 16，learning rate `2e-5`。
-- Checkpoint 明確依官方競賽權重計算 validation pair AP：
-  - T1：`0.20`
-  - T2：`0.15`
-  - T3：`0.30`
-  - T4：`0.35`
-- Notebook 會驗證儲存的 best checkpoint 確實對應最高 `weighted_ap`，避免誤用 validation loss。
+- 五個 fold probability soft voting。
+- 每個 task head 依 validation macro F1 選擇。
+- T2 支援 ordinal cumulative logistic head。
+- T4 支援 MLP head 與 synthetic sample weighting。
+- 推論套用 T1/T3 thresholds 與相同階層 routing。
 
-### Pair Sampling
+已知相容性限制：目前 SetFit 內部及匯出仍使用 legacy T2 標籤 `longer_than_5_years`，尚未套用 CKIP-BERT v3 的官方 `more_than_5_years` 匯出正規化。提交 SetFit 結果前必須先修正或後處理該欄位。
 
-- 所有 contrastive pairs 禁止 self-pair 與重複 pair。
-- T1、T3 保留平衡正負 pairs，並各加入 240 個 hard negatives。
-- T2 使用不平衡感知採樣：
-  - `within_2_years` 使用最多 378 個唯一 positive pairs。
-  - 每類 500 個 negative pairs。
-  - 相鄰時間區間獲得較高負樣本抽樣權重。
-  - 額外加入 600 個相鄰區間 hard negatives。
-- T4 positive pairs：
-  - `Clear=600`
-  - `Not Clear=600`
-  - `Misleading=300`
-- T4 額外加入 800 個指定類別邊界 hard negatives。
-- 現有 synthetic `Misleading` rows 仍保留；沒有新增資料列或新文本。
-
-### Task Heads
-
-四個任務都依該 fold validation macro F1 選擇分類頭，不只最佳化 T2/T4。
-
-- Logistic regression：比較 balanced 與平方根反頻率 class weight。
-- Calibrated LinearSVC：比較相同兩種 class weight。
-- T2 額外比較 ordinal cumulative logistic head。
-- T4 額外比較 MLP head。
-- T4 synthetic rows 的 head sample weight 固定為 `0.35`。
-
-完成五 folds 後，只搜尋 T1/T3 routing thresholds，目標為官方 competition weighted score。
-
-## Validation And Quality Gate
-
-訓練完成後會輸出：
-
-- 每個 fold 的 T1-T4 macro F1 與 weighted F1。
-- 每個 fold 的 per-class report 與 confusion matrix。
-- Pooled OOF metrics、predictions 與 probabilities。
-- 官方權重 competition score。
-
-T1/T3 設有回歸檢查：
-
-- 參考 T1 OOF macro F1：`0.766654`
-- 參考 T3 OOF macro F1：`0.709650`
-- 任一任務下降超過 `0.01` 時，quality gate 失敗並禁止 Hugging Face upload。
-
-Notebook 程式已通過 pair、ordinal probability、JSON 與語法測試，但更新後的實際 5-fold GPU 分數必須重新執行訓練後才能取得。
-
-## SetFit Artifacts
-
-訓練輸出：
+SetFit artifact：
 
 ```text
 setfit_outputs/
@@ -194,8 +278,6 @@ setfit_outputs/
 |   `-- task_heads.joblib
 |-- ...
 |-- fold_5/
-|   |-- encoder/
-|   `-- task_heads.joblib
 |-- setfit_thresholds.json
 |-- setfit_inference_config.json
 |-- setfit_oof_predictions.csv
@@ -203,16 +285,7 @@ setfit_outputs/
 `-- README.md
 ```
 
-外部 CSV 介面沒有改變，但 artifact 內部版本已更新為 `artifact_version=2`：
-
-- `task_heads.joblib` 可能包含 T2 ordinal head。
-- `setfit_inference_config.json` 記錄 weighted AP、pair profile、head candidates 與 quality gate。
-- 更新後的 `model_setfit_inference.ipynb` 可讀取舊版 v1 與新版 v2 config。
-- 新版 ordinal artifact 必須使用更新後的 inference notebook。
-
-## Inference
-
-本機 artifact：
+本機推論：
 
 ```python
 ensemble_inference_and_export(
@@ -232,5 +305,3 @@ ensemble_inference_and_export(
     output_csv_path="final_submission.csv",
 )
 ```
-
-Inference 會執行五個 fold 的 probability soft voting，再套用 T1/T3 thresholds 與原有 routing 規則。
