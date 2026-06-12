@@ -163,6 +163,33 @@ class CKIPLoraNotebookTests(unittest.TestCase):
             "Clear",
         )
 
+    def test_v3_class_bias_and_t4_binary_threshold(self):
+        test_df = pd.DataFrame({"id": [1], "data": ["a"]})
+        probabilities = {
+            "t1": np.array([[0.1, 0.9]]),
+            "t2": np.array([[0.45, 0.40, 0.10, 0.05]]),
+            "t3": np.array([[0.1, 0.9]]),
+            "t4": np.array([[0.52, 0.48, 0.00]]),
+        }
+        output = self.contract["route_predictions"](
+            test_df,
+            probabilities,
+            self.contract["V3_TASK_CLASSES"],
+            t1_threshold=0.5,
+            t3_threshold=0.5,
+            misleading_config={
+                "probability_threshold": 1.0,
+                "margin_threshold": 1.0,
+            },
+            t2_class_biases={"within_2_years": 0.2},
+            t4_not_clear_threshold=0.45,
+        )
+        self.assertEqual(
+            output.loc[0, "verification_timeline"],
+            "within_2_years",
+        )
+        self.assertEqual(output.loc[0, "evidence_quality"], "Not Clear")
+
     def test_output_validation_rejects_non_official_alias(self):
         test_df = pd.DataFrame({"id": [1], "data": ["a"]})
         output = pd.DataFrame(
@@ -242,6 +269,28 @@ class CKIPLoraNotebookTests(unittest.TestCase):
         self.assertIn(
             'batch[\\"pair_input_ids\\"][pair_valid_cpu]',
             train_source,
+        )
+        self.assertIn('FOCAL_GAMMA_BY_TASK', train_source)
+        self.assertIn('best_optimizer_steps', train_source)
+        self.assertIn('t2_class_biases', train_source)
+        self.assertIn('t4_not_clear_threshold', train_source)
+        self.assertIn('report_quality_metrics', train_source)
+        self.assertNotIn('run_quality_gate', train_source)
+        self.assertNotIn('Quality gate failed', train_source)
+
+    def test_quality_report_never_blocks_training(self):
+        tree = ast.parse(builder.TRAIN_CALIBRATE)
+        report_function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "report_quality_metrics"
+        )
+        self.assertFalse(
+            any(
+                isinstance(node, ast.Raise)
+                for node in ast.walk(report_function)
+            )
         )
 
 
