@@ -136,7 +136,7 @@ USE_AMP = DEVICE.type == "cuda"
 
 PROJECT_ROOT = Path.cwd().resolve()
 for candidate in [PROJECT_ROOT, *PROJECT_ROOT.parents]:
-    if (candidate / "app" / "data" / "ori_data").exists():
+    if (candidate / "app" / "data" / "clean_data").exists():
         PROJECT_ROOT = candidate
         break
 
@@ -196,24 +196,87 @@ def read_csv_local_or_remote(relative_path):
     return pd.read_csv(f"{RAW_BASE_URL}{relative_path.as_posix()}")
 
 
-def load_real_data():
-    frames = [
-        read_csv_local_or_remote(Path("ori_data") / "vpesg4k_train_1000 V1.csv"),
-        read_csv_local_or_remote(Path("ori_data") / "vpesg4k_val_1000.csv"),
-    ]
-    real_df = pd.concat(frames, ignore_index=True)
-    for column in TARGET_COLUMNS:
-        real_df[column] = real_df[column].apply(normalize_value)
-    return real_df
-
-
-def load_synthetic_data():
-    synthetic_df = read_csv_local_or_remote(
-        Path("ori_data") / "augmented_misleading_data.csv"
+def read_fold_csv(fold, split):
+    if fold not in FOLDS:
+        raise ValueError(f"Unknown fold: {fold}")
+    if split not in {"train", "val"}:
+        raise ValueError(f"Unknown split: {split}")
+    return read_csv_local_or_remote(
+        Path("clean_data") / f"{split}_fold_{fold}.csv"
     )
+
+
+def normalize_training_frame(df):
+    result = df.copy()
     for column in TARGET_COLUMNS:
-        synthetic_df[column] = synthetic_df[column].apply(normalize_value)
-    return synthetic_df
+        result[column] = result[column].apply(normalize_value)
+    return result
+
+
+def load_real_data():
+    """Load the five prepared train/validation folds.
+
+    Validation folds are disjoint and together contain all 2,000 real rows.
+    The same synthetic rows are injected into every train fold, so they are
+    de-duplicated by id before synthetic source-group assignment.
+    """
+    fold_frames = {}
+    real_parts = []
+    synthetic_parts = []
+    for fold in FOLDS:
+        train_df = normalize_training_frame(read_fold_csv(fold, "train"))
+        val_df = normalize_training_frame(read_fold_csv(fold, "val"))
+        validate_training_frame(train_df, f"train_fold_{fold}")
+        validate_training_frame(val_df, f"val_fold_{fold}")
+
+        numeric_train_ids = pd.to_numeric(
+            train_df[ID_COLUMN],
+            errors="coerce",
+        )
+        train_real_df = train_df[numeric_train_ids < SYNTHETIC_ID_MIN].copy()
+        train_synthetic_df = train_df[
+            numeric_train_ids >= SYNTHETIC_ID_MIN
+        ].copy()
+        if set(train_real_df[ID_COLUMN]) & set(val_df[ID_COLUMN]):
+            raise ValueError(f"Fold {fold} has train/validation id leakage.")
+
+        fold_frames[fold] = {
+            "train": train_df,
+            "train_real": train_real_df,
+            "val": val_df,
+        }
+        real_parts.append(val_df)
+        synthetic_parts.append(train_synthetic_df)
+
+    real_df = pd.concat(real_parts, ignore_index=True)
+    validate_training_frame(real_df, "combined_real_data")
+    numeric_real_ids = pd.to_numeric(real_df[ID_COLUMN], errors="coerce")
+    if numeric_real_ids.isna().any() or (
+        numeric_real_ids >= SYNTHETIC_ID_MIN
+    ).any():
+        raise ValueError("Validation folds must contain only real numeric ids.")
+
+    synthetic_all = pd.concat(synthetic_parts, ignore_index=True)
+    synthetic_df = synthetic_all.drop_duplicates(
+        subset=[ID_COLUMN],
+        keep="first",
+    ).reset_index(drop=True)
+    validate_training_frame(synthetic_df, "combined_synthetic_data")
+    expected_synthetic_ids = set(synthetic_df[ID_COLUMN])
+    for fold in FOLDS:
+        fold_synthetic_ids = set(
+            fold_frames[fold]["train"][ID_COLUMN]
+        ) - set(fold_frames[fold]["train_real"][ID_COLUMN])
+        if fold_synthetic_ids != expected_synthetic_ids:
+            raise ValueError(
+                f"Fold {fold} synthetic ids differ from the other folds."
+            )
+
+    print(
+        f"Loaded five folds: real={len(real_df)}, "
+        f"synthetic={len(synthetic_df)}"
+    )
+    return real_df, synthetic_df, fold_frames
 
 
 def validate_training_frame(df, name):
@@ -226,9 +289,7 @@ def validate_training_frame(df, name):
 
 
 def load_fold_ids(fold):
-    fold_df = read_csv_local_or_remote(
-        Path("clean_data") / f"val_fold_{fold}.csv"
-    )
+    fold_df = read_fold_csv(fold, "val")
     return set(fold_df[ID_COLUMN].tolist())
 
 
@@ -273,10 +334,9 @@ def attach_source_pairs(synthetic_df, real_df):
     return paired
 
 
-def build_fold_frames(real_df, synthetic_df, fold):
-    val_ids = load_fold_ids(fold)
-    val_df = real_df[real_df[ID_COLUMN].isin(val_ids)].copy()
-    train_real_df = real_df[~real_df[ID_COLUMN].isin(val_ids)].copy()
+def build_fold_frames(fold_frames, synthetic_df, fold):
+    val_df = fold_frames[fold]["val"].copy()
+    train_real_df = fold_frames[fold]["train_real"].copy()
     synthetic_train = synthetic_df[synthetic_df["synthetic_fold"] != fold].copy()
     synthetic_holdout = synthetic_df[synthetic_df["synthetic_fold"] == fold].copy()
     train_df = pd.concat([train_real_df, synthetic_train], ignore_index=True)
@@ -1163,12 +1223,12 @@ TRAIN_LOOPS = r'''# ==========================================
 def train_one_fold(
     fold,
     tokenizer,
-    real_df,
     synthetic_df,
+    fold_frames,
 ):
     set_seed(SEED + fold)
     train_df, val_df, synthetic_holdout = build_fold_frames(
-        real_df,
+        fold_frames,
         synthetic_df,
         fold,
     )
@@ -1250,9 +1310,9 @@ def train_one_fold(
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
 tokenizer.save_pretrained(TOKENIZER_DIR)
-real_df = load_real_data()
+real_df, raw_synthetic_df, fold_frames = load_real_data()
 synthetic_df = assign_synthetic_folds(
-    attach_source_pairs(load_synthetic_data(), real_df)
+    attach_source_pairs(raw_synthetic_df, real_df)
 )
 validate_training_frame(real_df, "real_data")
 validate_training_frame(synthetic_df, "synthetic_data")
@@ -1272,7 +1332,7 @@ for fold in FOLDS:
         fold_history,
         best_epoch,
         best_score,
-    ) = train_one_fold(fold, tokenizer, real_df, synthetic_df)
+    ) = train_one_fold(fold, tokenizer, synthetic_df, fold_frames)
     oof_truth_parts.append(fold_truth)
     oof_logits_parts.append(fold_logits)
     synthetic_logits_parts.append(fold_synthetic_logits)

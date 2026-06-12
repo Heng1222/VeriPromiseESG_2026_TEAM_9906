@@ -49,6 +49,11 @@ def load_training_data_contract():
     tree = ast.parse(builder.TRAIN_DATA)
     functions = {
         "normalize_value",
+        "read_csv_local_or_remote",
+        "read_fold_csv",
+        "normalize_training_frame",
+        "validate_training_frame",
+        "load_real_data",
         "source_group_key",
         "assign_synthetic_folds",
         "attach_source_pairs",
@@ -61,8 +66,20 @@ def load_training_data_contract():
     namespace = {
         "np": np,
         "pd": pd,
+        "Path": Path,
         "SEED": 42,
+        "FOLDS": [1, 2, 3, 4, 5],
+        "LOCAL_DATA_DIR": MODEL_DIR.parent / "data",
+        "RAW_BASE_URL": "unused://",
+        "ID_COLUMN": "id",
         "TEXT_COLUMN": "data",
+        "TARGET_COLUMNS": [
+            "promise_status",
+            "verification_timeline",
+            "evidence_status",
+            "evidence_quality",
+        ],
+        "SYNTHETIC_ID_MIN": 90000,
     }
     exec(compile(ast.Module(selected, type_ignores=[]), "<training-data>", "exec"), namespace)
     return namespace
@@ -180,16 +197,24 @@ class CKIPLoraNotebookTests(unittest.TestCase):
         self.assertEqual(group_folds.size, 37)
         self.assertEqual(set(assigned["synthetic_fold"]), {1, 2, 3, 4, 5})
 
+    def test_fold_loader_reconstructs_real_and_synthetic_data(self):
+        real, synthetic, folds = self.training_data["load_real_data"]()
+        self.assertEqual(len(real), 2000)
+        self.assertEqual(real["id"].nunique(), 2000)
+        self.assertEqual(len(synthetic), 111)
+        self.assertEqual(synthetic["id"].nunique(), 111)
+        expected_synthetic_ids = set(synthetic["id"])
+        for fold in range(1, 6):
+            self.assertEqual(len(folds[fold]["train_real"]), 1600)
+            self.assertEqual(len(folds[fold]["val"]), 400)
+            train_synthetic_ids = (
+                set(folds[fold]["train"]["id"])
+                - set(folds[fold]["train_real"]["id"])
+            )
+            self.assertEqual(train_synthetic_ids, expected_synthetic_ids)
+
     def test_synthetic_pairs_match_expected_real_sources(self):
-        data_dir = MODEL_DIR.parent / "data" / "ori_data"
-        real = pd.concat(
-            [
-                pd.read_csv(data_dir / "vpesg4k_train_1000 V1.csv"),
-                pd.read_csv(data_dir / "vpesg4k_val_1000.csv"),
-            ],
-            ignore_index=True,
-        )
-        synthetic = pd.read_csv(data_dir / "augmented_misleading_data.csv")
+        real, synthetic, _ = self.training_data["load_real_data"]()
         paired = self.training_data["attach_source_pairs"](synthetic, real)
         self.assertEqual(int(paired["pair_valid"].sum()), 105)
 

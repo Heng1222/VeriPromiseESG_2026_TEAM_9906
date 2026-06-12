@@ -20,15 +20,17 @@ CKIP-BERT 與 SetFit 的外部 CSV 介面相同，但 artifact 不相容，必�
 新版 `model_train.ipynb` 讀取：
 
 ```text
-app/data/ori_data/vpesg4k_train_1000 V1.csv
-app/data/ori_data/vpesg4k_val_1000.csv
-app/data/ori_data/augmented_misleading_data.csv
+app/data/clean_data/train_fold_1.csv
+...
+app/data/clean_data/train_fold_5.csv
 app/data/clean_data/val_fold_1.csv
 ...
 app/data/clean_data/val_fold_5.csv
 ```
 
-兩份官方 labeled data 合併為 2,000 筆真實資料。`val_fold_*.csv` 只用來取得既有 fold ID，不直接當成另一份資料加入。111 筆 synthetic `Misleading` 資料只參與 T4 與 paired contrastive loss。
+資料載入方式與 SetFit notebook 一致，每個 fold 都直接讀取對應的 `train_fold_*.csv` 與 `val_fold_*.csv`。五份互斥的 validation folds 合併為 2,000 筆真實資料；每份 train fold 中重複注入的 111 筆 synthetic `Misleading` 會按 `id` 去重後使用。
+
+每個 fold 訓練時直接採用該 `train_fold` 中的 1,600 筆真實資料，再依 synthetic source-group holdout 規則加入四份 synthetic groups；validation 則直接使用該 `val_fold` 的 400 筆真實資料。
 
 必要欄位：
 
