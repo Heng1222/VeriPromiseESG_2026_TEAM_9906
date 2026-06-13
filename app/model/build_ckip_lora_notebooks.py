@@ -49,7 +49,13 @@ from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from sklearn.metrics import classification_report, confusion_matrix, f1_score
 from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
-from transformers import AutoModel, AutoTokenizer, get_cosine_schedule_with_warmup
+from transformers import (
+    AutoModel,
+    AutoModelForMaskedLM,
+    AutoTokenizer,
+    DataCollatorForLanguageModeling,
+    get_cosine_schedule_with_warmup,
+)
 
 warnings.filterwarnings("ignore")
 
@@ -79,6 +85,21 @@ HEAD_LR = 3e-4
 WEIGHT_DECAY = 0.01
 WARMUP_RATIO = 0.10
 MAX_GRAD_NORM = 1.0
+
+MLM_MAX_LEN = 512
+MLM_STRIDE = 64
+MLM_PROBABILITY = 0.15
+MLM_BATCH_SIZE = 4
+MLM_GRAD_ACCUM_STEPS = 4
+MLM_EPOCHS = 3
+MLM_LR = 5e-5
+MLM_WEIGHT_DECAY = 0.01
+MLM_WARMUP_RATIO = 0.10
+MLM_CORPUS_FILES = {
+    "train": (Path("ori_data") / "vpesg4k_train_1000 V1.csv", 1000),
+    "val": (Path("ori_data") / "vpesg4k_val_1000.csv", 1000),
+    "test": (Path("ori_data") / "vpesg4k_test_2000.csv", 2000),
+}
 
 FOCAL_GAMMA_BY_TASK = {
     "t1": 1.5,
@@ -151,6 +172,9 @@ RAW_BASE_URL = "https://raw.githubusercontent.com/Heng1222/VeriPromiseESG_2026_T
 OUTPUT_DIR = Path("mtl_outputs")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 TOKENIZER_DIR = OUTPUT_DIR / "tokenizer"
+MLM_BACKBONE_DIR = OUTPUT_DIR / "mlm_backbone"
+MLM_CONFIG_JSON = OUTPUT_DIR / "mlm_config.json"
+MLM_HISTORY_CSV = OUTPUT_DIR / "mlm_training_history.csv"
 OOF_LOGITS_CSV = OUTPUT_DIR / "mtl_oof_logits.csv"
 OOF_PROBABILITY_CSV = OUTPUT_DIR / "mtl_oof_probabilities.csv"
 OOF_PREDICTION_CSV = OUTPUT_DIR / "mtl_oof_predictions.csv"
@@ -162,7 +186,7 @@ INFERENCE_CONFIG_JSON = OUTPUT_DIR / "mtl_inference_config.json"
 RUN_HF_UPLOAD = False
 HF_MTL_REPO_ID = "maxbeettww/VeriPromise_ESG_2026_9906"
 HF_PRIVATE_REPO = False
-HF_COMMIT_MESSAGE = "Upload CKIP-BERT LoRA MTL artifact v3"
+HF_COMMIT_MESSAGE = "Upload CKIP-BERT ESG MLM + LoRA MTL artifact v4"
 
 print(f"Device: {DEVICE}")
 print(f"Project root: {PROJECT_ROOT}")
@@ -198,7 +222,42 @@ def read_csv_local_or_remote(relative_path):
     local_path = LOCAL_DATA_DIR / relative_path
     if local_path.exists():
         return pd.read_csv(local_path)
-    return pd.read_csv(f"{RAW_BASE_URL}{relative_path.as_posix()}")
+    remote_path = relative_path.as_posix().replace(" ", "%20")
+    return pd.read_csv(f"{RAW_BASE_URL}{remote_path}")
+
+
+def load_mlm_corpus():
+    parts = []
+    counts = {}
+    for split, (relative_path, expected_rows) in MLM_CORPUS_FILES.items():
+        frame = read_csv_local_or_remote(relative_path)
+        if TEXT_COLUMN not in frame.columns:
+            raise ValueError(f"{relative_path} missing column: {TEXT_COLUMN}")
+        text = frame[[TEXT_COLUMN]].copy()
+        invalid = (
+            text[TEXT_COLUMN].isna()
+            | text[TEXT_COLUMN].astype(str).str.strip().eq("")
+        )
+        if invalid.any():
+            raise ValueError(
+                f"{relative_path} contains {int(invalid.sum())} blank data rows."
+            )
+        if len(text) != expected_rows:
+            raise ValueError(
+                f"{relative_path} has {len(text)} rows; expected {expected_rows}."
+            )
+        text[TEXT_COLUMN] = text[TEXT_COLUMN].astype(str)
+        parts.append(text)
+        counts[split] = len(text)
+
+    corpus = pd.concat(parts, ignore_index=True)
+    expected_total = sum(expected for _, expected in MLM_CORPUS_FILES.values())
+    if len(corpus) != expected_total:
+        raise ValueError(
+            f"MLM corpus has {len(corpus)} rows; expected {expected_total}."
+        )
+    print(f"Loaded MLM corpus: {counts}, total={len(corpus)}")
+    return corpus
 
 
 def read_fold_csv(fold, split):
@@ -423,8 +482,222 @@ class ESGMTLDataset(Dataset):
 '''
 
 
+TRAIN_MLM = r'''# ==========================================
+# 2. ESG domain-adaptive masked language modeling
+# ==========================================
+
+class ESGMLMDataset(Dataset):
+    def __init__(self, examples):
+        self.examples = examples
+
+    def __len__(self):
+        return len(self.examples)
+
+    def __getitem__(self, index):
+        return self.examples[index]
+
+
+def build_mlm_examples(corpus, tokenizer):
+    examples = []
+    for text in tqdm(corpus[TEXT_COLUMN], desc="Tokenizing MLM corpus"):
+        encoded = tokenizer(
+            str(text),
+            add_special_tokens=True,
+            truncation=True,
+            max_length=MLM_MAX_LEN,
+            stride=MLM_STRIDE,
+            return_overflowing_tokens=True,
+            return_attention_mask=True,
+            return_special_tokens_mask=True,
+        )
+        input_ids = encoded["input_ids"]
+        attention_masks = encoded["attention_mask"]
+        special_masks = encoded["special_tokens_mask"]
+        if input_ids and isinstance(input_ids[0], int):
+            input_ids = [input_ids]
+            attention_masks = [attention_masks]
+            special_masks = [special_masks]
+        for ids, mask, special_mask in zip(
+            input_ids,
+            attention_masks,
+            special_masks,
+        ):
+            examples.append(
+                {
+                    "input_ids": ids,
+                    "attention_mask": mask,
+                    "special_tokens_mask": special_mask,
+                }
+            )
+    if not examples:
+        raise ValueError("MLM tokenization produced no examples.")
+    return examples
+
+
+def create_mlm_optimizer(model):
+    no_decay = ["bias", "LayerNorm.weight", "layer_norm.weight"]
+    named_parameters = [
+        (name, parameter)
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    ]
+    groups = []
+    for apply_decay in [True, False]:
+        parameters = [
+            parameter
+            for name, parameter in named_parameters
+            if (not any(token in name for token in no_decay)) == apply_decay
+        ]
+        if parameters:
+            groups.append(
+                {
+                    "params": parameters,
+                    "lr": MLM_LR,
+                    "weight_decay": MLM_WEIGHT_DECAY if apply_decay else 0.0,
+                }
+            )
+    return torch.optim.AdamW(groups)
+
+
+def train_mlm_backbone(corpus, tokenizer):
+    examples = build_mlm_examples(corpus, tokenizer)
+    collator = DataCollatorForLanguageModeling(
+        tokenizer=tokenizer,
+        mlm=True,
+        mlm_probability=MLM_PROBABILITY,
+        pad_to_multiple_of=8 if USE_AMP else None,
+    )
+    generator = torch.Generator().manual_seed(SEED)
+    loader = DataLoader(
+        ESGMLMDataset(examples),
+        batch_size=MLM_BATCH_SIZE,
+        shuffle=True,
+        generator=generator,
+        collate_fn=collator,
+        num_workers=0,
+        pin_memory=USE_AMP,
+    )
+    model = AutoModelForMaskedLM.from_pretrained(MODEL_NAME).to(DEVICE)
+    model.gradient_checkpointing_enable()
+    if hasattr(model.config, "use_cache"):
+        model.config.use_cache = False
+
+    optimizer = create_mlm_optimizer(model)
+    optimizer_steps_per_epoch = math.ceil(
+        len(loader) / MLM_GRAD_ACCUM_STEPS
+    )
+    total_steps = optimizer_steps_per_epoch * MLM_EPOCHS
+    warmup_steps = max(1, int(total_steps * MLM_WARMUP_RATIO))
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_steps,
+    )
+    scaler = torch.amp.GradScaler("cuda", enabled=USE_AMP)
+    history = []
+
+    for epoch in range(1, MLM_EPOCHS + 1):
+        model.train()
+        optimizer.zero_grad(set_to_none=True)
+        loss_sum = 0.0
+        for step, batch in enumerate(
+            tqdm(loader, desc=f"MLM epoch {epoch}/{MLM_EPOCHS}"),
+            start=1,
+        ):
+            batch = {
+                key: value.to(DEVICE)
+                for key, value in batch.items()
+            }
+            with torch.autocast(
+                device_type=DEVICE.type,
+                dtype=torch.float16,
+                enabled=USE_AMP,
+            ):
+                loss = model(**batch).loss
+                scaled_loss = loss / MLM_GRAD_ACCUM_STEPS
+            scaler.scale(scaled_loss).backward()
+            if (
+                step % MLM_GRAD_ACCUM_STEPS == 0
+                or step == len(loader)
+            ):
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    MAX_GRAD_NORM,
+                )
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+            loss_sum += float(loss.detach().cpu())
+
+        train_loss = loss_sum / len(loader)
+        row = {
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "perplexity": math.exp(min(train_loss, 20.0)),
+            "optimizer_steps": optimizer_steps_per_epoch,
+        }
+        history.append(row)
+        print(pd.DataFrame([row]).to_string(index=False))
+
+    if MLM_BACKBONE_DIR.exists():
+        shutil.rmtree(MLM_BACKBONE_DIR)
+    MLM_BACKBONE_DIR.mkdir(parents=True, exist_ok=True)
+    model.base_model.save_pretrained(
+        MLM_BACKBONE_DIR,
+        safe_serialization=True,
+    )
+    history_df = pd.DataFrame(history)
+    history_df.to_csv(MLM_HISTORY_CSV, index=False)
+    mlm_config = {
+        "original_model_name": MODEL_NAME,
+        "backbone_path": MLM_BACKBONE_DIR.name,
+        "documents": len(corpus),
+        "training_examples": len(examples),
+        "corpus": {
+            split: {
+                "path": relative_path.as_posix(),
+                "rows": expected_rows,
+            }
+            for split, (relative_path, expected_rows)
+            in MLM_CORPUS_FILES.items()
+        },
+        "text_column": TEXT_COLUMN,
+        "max_length": MLM_MAX_LEN,
+        "stride": MLM_STRIDE,
+        "mask_probability": MLM_PROBABILITY,
+        "epochs": MLM_EPOCHS,
+        "batch_size": MLM_BATCH_SIZE,
+        "gradient_accumulation_steps": MLM_GRAD_ACCUM_STEPS,
+        "learning_rate": MLM_LR,
+        "weight_decay": MLM_WEIGHT_DECAY,
+        "warmup_ratio": MLM_WARMUP_RATIO,
+        "gradient_checkpointing": True,
+    }
+    with open(MLM_CONFIG_JSON, "w", encoding="utf-8") as file:
+        json.dump(mlm_config, file, ensure_ascii=False, indent=2)
+
+    del model, loader, examples
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    print(f"Saved ESG-adapted backbone to {MLM_BACKBONE_DIR}.")
+    return history_df, mlm_config
+
+
+set_seed(SEED)
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
+mlm_corpus = load_mlm_corpus()
+mlm_history, mlm_config = train_mlm_backbone(mlm_corpus, tokenizer)
+tokenizer.save_pretrained(TOKENIZER_DIR)
+del mlm_corpus
+gc.collect()
+'''
+
+
 TRAIN_MODEL = r'''# ==========================================
-# 2. LoRA backbone, pooling, MLP heads, and losses
+# 3. LoRA backbone, pooling, MLP heads, and losses
 # ==========================================
 
 def make_lora_config():
@@ -440,9 +713,14 @@ def make_lora_config():
 
 
 class ESGLoraMTLModel(nn.Module):
-    def __init__(self, model_name, adapter_dir=None, is_trainable=True):
+    def __init__(
+        self,
+        backbone_name_or_path,
+        adapter_dir=None,
+        is_trainable=True,
+    ):
         super().__init__()
-        base_model = AutoModel.from_pretrained(model_name)
+        base_model = AutoModel.from_pretrained(backbone_name_or_path)
         if adapter_dir is None:
             self.backbone = get_peft_model(base_model, make_lora_config())
         else:
@@ -648,7 +926,7 @@ def calculate_mtl_loss(model, logits, features, batch, class_weights):
 
 
 TRAIN_METRICS = r'''# ==========================================
-# 3. Calibration, routing, metrics, and diagnostics
+# 4. Calibration, routing, metrics, and diagnostics
 # ==========================================
 
 def softmax_numpy(values):
@@ -1306,7 +1584,7 @@ def print_reports(true_df, prediction_df, title):
 
 
 TRAIN_ARTIFACTS = r'''# ==========================================
-# 4. Optimizer and artifact helpers
+# 5. Optimizer and artifact helpers
 # ==========================================
 
 def create_optimizer(model):
@@ -1339,7 +1617,7 @@ def create_optimizer(model):
     return torch.optim.AdamW(groups)
 
 
-def save_v3_model(model, member_dir, metadata):
+def save_v4_model(model, member_dir, metadata):
     member_dir = Path(member_dir)
     adapter_dir = member_dir / "adapter"
     if adapter_dir.exists():
@@ -1351,10 +1629,10 @@ def save_v3_model(model, member_dir, metadata):
         json.dump(metadata, file, ensure_ascii=False, indent=2)
 
 
-def load_v3_model(member_dir, is_trainable=False):
+def load_v4_model(member_dir, is_trainable=False):
     member_dir = Path(member_dir)
     model = ESGLoraMTLModel(
-        MODEL_NAME,
+        MLM_BACKBONE_DIR,
         adapter_dir=member_dir / "adapter",
         is_trainable=is_trainable,
     ).to(DEVICE)
@@ -1374,7 +1652,7 @@ def assert_save_load_parity(model, member_dir, data_loader, atol=1e-5):
     model.eval()
     with torch.no_grad():
         expected = model(input_ids, attention_mask)
-    reloaded = load_v3_model(member_dir)
+    reloaded = load_v4_model(member_dir)
     reloaded.eval()
     with torch.no_grad():
         actual = reloaded(input_ids, attention_mask)
@@ -1510,11 +1788,12 @@ def train_epochs(
             best_score = score
             best_epoch = epoch
             without_improvement = 0
-            save_v3_model(
+            save_v4_model(
                 model,
                 checkpoint_dir,
                 {
-                    "artifact_version": 3,
+                    "artifact_version": 4,
+                    "backbone_path": MLM_BACKBONE_DIR.name,
                     "best_epoch": epoch,
                     "metrics": metrics,
                 },
@@ -1530,7 +1809,7 @@ def train_epochs(
 
 
 TRAIN_LOOPS = r'''# ==========================================
-# 5. Five-fold OOF training
+# 6. Five-fold OOF training
 # ==========================================
 
 def train_one_fold(
@@ -1557,7 +1836,7 @@ def train_one_fold(
         tokenizer,
         is_test=True,
     )
-    model = ESGLoraMTLModel(MODEL_NAME).to(DEVICE)
+    model = ESGLoraMTLModel(MLM_BACKBONE_DIR).to(DEVICE)
     model.backbone.print_trainable_parameters()
     class_weights = compute_fold_class_weights(train_df)
     fold_dir = OUTPUT_DIR / f"fold_{fold}"
@@ -1594,7 +1873,7 @@ def train_one_fold(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    best_model = load_v3_model(fold_dir)
+    best_model = load_v4_model(fold_dir)
     val_logits = predict_logits(best_model, val_loader)
     synthetic_logits = predict_logits(best_model, synthetic_loader)
     val_logits_df = logits_to_frame(val_df, val_logits)
@@ -1622,8 +1901,6 @@ def train_one_fold(
     )
 
 
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
-tokenizer.save_pretrained(TOKENIZER_DIR)
 real_df, raw_synthetic_df, fold_frames = load_real_data()
 synthetic_df = assign_synthetic_folds(
     attach_source_pairs(raw_synthetic_df, real_df)
@@ -1681,7 +1958,7 @@ print(f"Best optimizer steps: {best_optimizer_steps}")
 
 
 TRAIN_CALIBRATE = r'''# ==========================================
-# 6. OOF calibration, stable routing, and non-blocking diagnostics
+# 7. OOF calibration, stable routing, and non-blocking diagnostics
 # ==========================================
 
 temperatures = fit_scalar_temperatures(oof_true_df, oof_logits_df)
@@ -1885,7 +2162,7 @@ quality_metrics = report_quality_metrics(
 
 
 TRAIN_FULL = r'''# ==========================================
-# 7. Full-data three-seed ensemble
+# 8. Full-data three-seed ensemble
 # ==========================================
 
 full_train_df = pd.concat(
@@ -1919,7 +2196,7 @@ for seed in FULL_DATA_SEEDS:
         shuffle=True,
         seed=seed,
     )
-    model = ESGLoraMTLModel(MODEL_NAME).to(DEVICE)
+    model = ESGLoraMTLModel(MLM_BACKBONE_DIR).to(DEVICE)
     history, _, _ = train_epochs(
         model,
         full_loader,
@@ -1929,11 +2206,12 @@ for seed in FULL_DATA_SEEDS:
     member_dir = OUTPUT_DIR / f"full_seed_{seed}"
     member_dir.mkdir(parents=True, exist_ok=True)
     history.to_csv(member_dir / "training_history.csv", index=False)
-    save_v3_model(
+    save_v4_model(
         model,
         member_dir,
         {
-            "artifact_version": 3,
+            "artifact_version": 4,
+            "backbone_path": MLM_BACKBONE_DIR.name,
             "member_type": "full_data",
             "seed": seed,
             "epochs": FULL_DATA_EPOCHS,
@@ -1952,14 +2230,16 @@ for seed in FULL_DATA_SEEDS:
 
 
 TRAIN_SAVE = r'''# ==========================================
-# 8. Save v3 inference config and optionally upload
+# 9. Save v4 inference config and optionally upload
 # ==========================================
 
 def save_inference_config():
     config = {
-        "artifact_version": 3,
-        "model_type": "ckip_bert_lora_multi_task_mlp",
+        "artifact_version": 4,
+        "model_type": "ckip_bert_esg_mlm_lora_multi_task_mlp",
         "model_name": MODEL_NAME,
+        "backbone_path": MLM_BACKBONE_DIR.name,
+        "mlm": mlm_config,
         "max_len": MAX_LEN,
         "head_ratio": HEAD_RATIO,
         "task_classes": TASK_CLASSES,
@@ -2006,9 +2286,12 @@ def save_inference_config():
             "total_rows": len(synthetic_df),
         },
         "artifact_layout": {
+            "backbone": MLM_BACKBONE_DIR.name + "/",
             "adapter": "{ensemble_member}/adapter/",
             "heads": "{ensemble_member}/heads.pt",
             "tokenizer": "tokenizer/",
+            "mlm_config": MLM_CONFIG_JSON.name,
+            "mlm_history": MLM_HISTORY_CSV.name,
             "calibration": "mtl_calibration.json",
             "thresholds": "mtl_thresholds.json",
         },
@@ -2020,6 +2303,21 @@ def save_inference_config():
 
 def validate_artifacts():
     missing = []
+    for path in [
+        MLM_BACKBONE_DIR / "config.json",
+        MLM_CONFIG_JSON,
+        MLM_HISTORY_CSV,
+    ]:
+        if not Path(path).exists():
+            missing.append(str(path))
+    backbone_weights = [
+        MLM_BACKBONE_DIR / "model.safetensors",
+        MLM_BACKBONE_DIR / "pytorch_model.bin",
+    ]
+    if not any(path.exists() for path in backbone_weights):
+        missing.append(
+            f"{MLM_BACKBONE_DIR}/model.safetensors|pytorch_model.bin"
+        )
     for seed in FULL_DATA_SEEDS:
         member_dir = OUTPUT_DIR / f"full_seed_{seed}"
         adapter_dir = member_dir / "adapter"
@@ -2047,7 +2345,7 @@ def validate_artifacts():
         if not Path(path).exists():
             missing.append(str(path))
     if missing:
-        raise FileNotFoundError("Missing MTL v3 artifacts: " + ", ".join(missing))
+        raise FileNotFoundError("Missing MTL v4 artifacts: " + ", ".join(missing))
 
 
 def push_artifacts_to_hf(repo_id=HF_MTL_REPO_ID, private=HF_PRIVATE_REPO):
@@ -2097,7 +2395,7 @@ from transformers import AutoModel, AutoTokenizer
 
 
 # ==========================================
-# CKIP-BERT artifact v1/v2/v3 inference
+# CKIP-BERT artifact v1/v2/v3/v4 inference
 # ==========================================
 
 DEFAULT_MODEL_NAME = "ckiplab/bert-base-chinese"
@@ -2186,9 +2484,9 @@ class ESGInferenceDataset(Dataset):
 
 
 class ESGLoraMTLModel(nn.Module):
-    def __init__(self, model_name, adapter_dir):
+    def __init__(self, backbone_name_or_path, adapter_dir):
         super().__init__()
-        base_model = AutoModel.from_pretrained(model_name)
+        base_model = AutoModel.from_pretrained(backbone_name_or_path)
         self.backbone = PeftModel.from_pretrained(
             base_model,
             adapter_dir,
@@ -2346,7 +2644,7 @@ def resolve_artifact_root(repo_id=None, model_dir=None):
         with open(config_path, "r", encoding="utf-8") as file:
             remote_config = json.load(file)
         version = int(remote_config.get("artifact_version", 1))
-        if version == 3:
+        if version in {3, 4}:
             allow_patterns = [
                 config_filename,
                 "mtl_thresholds.json",
@@ -2362,6 +2660,17 @@ def resolve_artifact_root(repo_id=None, model_dir=None):
                 "mtl_outputs/full_seed_*/heads.pt",
                 "mtl_outputs/full_seed_*/metadata.json",
             ]
+            if version == 4:
+                allow_patterns.extend(
+                    [
+                        "mlm_backbone/**",
+                        "mlm_config.json",
+                        "mlm_training_history.csv",
+                        "mtl_outputs/mlm_backbone/**",
+                        "mtl_outputs/mlm_config.json",
+                        "mtl_outputs/mlm_training_history.csv",
+                    ]
+                )
         else:
             allow_patterns = [
                 config_filename,
@@ -2405,7 +2714,7 @@ def load_config(root):
         }
     with open(path, "r", encoding="utf-8") as file:
         config = json.load(file)
-    if int(config.get("artifact_version", 1)) not in {1, 2, 3}:
+    if int(config.get("artifact_version", 1)) not in {1, 2, 3, 4}:
         raise ValueError(
             f"Unsupported artifact version: {config.get('artifact_version')}"
         )
@@ -2670,11 +2979,27 @@ def resolve_legacy_checkpoint(root, fold, repo_id=None):
     raise FileNotFoundError(f"Missing legacy checkpoint for fold {fold}.")
 
 
-def ensemble_v3(root, config, data_loader):
+def resolve_peft_backbone(root, config):
+    version = int(config.get("artifact_version", 1))
+    if version == 4:
+        backbone_path = Path(root) / config.get(
+            "backbone_path",
+            "mlm_backbone",
+        )
+        if not (backbone_path / "config.json").exists():
+            raise FileNotFoundError(
+                f"Missing artifact v4 MLM backbone: {backbone_path}"
+            )
+        return str(backbone_path)
+    return config.get("model_name", DEFAULT_MODEL_NAME)
+
+
+def ensemble_peft(root, config, data_loader):
     members = config.get("ensemble_members", [])
     if not members:
-        raise ValueError("Artifact v3 has no ensemble_members.")
+        raise ValueError("PEFT artifact has no ensemble_members.")
     temperatures = config.get("temperatures", {})
+    backbone_name_or_path = resolve_peft_backbone(root, config)
     accumulated = {
         task: None
         for task in V3_TASK_CLASSES
@@ -2683,7 +3008,7 @@ def ensemble_v3(root, config, data_loader):
         member_dir = Path(root) / member
         print(f"Loading CKIP-BERT LoRA member {member}")
         model = ESGLoraMTLModel(
-            config.get("model_name", DEFAULT_MODEL_NAME),
+            backbone_name_or_path,
             member_dir / "adapter",
         ).to(DEVICE)
         model.load_heads(member_dir / "heads.pt")
@@ -2785,8 +3110,8 @@ def ensemble_inference_and_export(
         head_ratio,
     )
 
-    if version == 3:
-        probabilities = ensemble_v3(root, config, data_loader)
+    if version in {3, 4}:
+        probabilities = ensemble_peft(root, config, data_loader)
         task_classes = V3_TASK_CLASSES
         misleading_config = thresholds.get("misleading", {})
     else:
@@ -2823,7 +3148,7 @@ INFERENCE_RUN = r'''# ==========================================
 # Run inference
 # ==========================================
 
-# Local v3 or legacy artifacts:
+# Local v4, v3, or legacy artifacts:
 # ensemble_inference_and_export(
 #     repo_id=None,
 #     test_csv_path="/content/test.csv",
@@ -2874,7 +3199,9 @@ def build_train_notebook() -> dict:
             ),
             markdown(
                 "# CKIP-BERT LoRA Multi-Task Training\n\n"
-                "Artifact v3 uses RSLoRA across all CKIP-BERT linear layers, "
+                "Artifact v4 first performs ESG domain-adaptive masked language "
+                "modeling on the 4,000 official train/validation/test texts, then "
+                "uses RSLoRA across all adapted CKIP-BERT linear layers. It keeps "
                 "task-specific focal/cross-entropy objectives, grouped synthetic "
                 "holdouts, OOF temperature and class-bias calibration, "
                 "optimizer-step-aligned full-data training, and three ensemble "
@@ -2887,6 +3214,7 @@ def build_train_notebook() -> dict:
             ),
             code(TRAIN_IMPORTS_CONFIG),
             code(TRAIN_DATA),
+            code(TRAIN_MLM),
             code(TRAIN_MODEL),
             code(TRAIN_METRICS),
             code(TRAIN_ARTIFACTS),
@@ -2910,9 +3238,10 @@ def build_inference_notebook() -> dict:
             ),
             markdown(
                 "# CKIP-BERT Multi-Task Inference\n\n"
-                "Loads artifact v3 LoRA full-data ensembles and remains backward "
-                "compatible with v1/v2 full checkpoints. Input is `id,data`; "
-                "output is the official five-column submission schema.\n"
+                "Loads artifact v4 ESG-MLM backbone plus LoRA full-data ensembles "
+                "and remains backward compatible with v1/v2 full checkpoints and "
+                "v3 LoRA artifacts. Input is `id,data`; output is the official "
+                "five-column submission schema.\n"
             ),
             code(
                 "# Colab dependency installation. Restart the runtime if requested.\n"

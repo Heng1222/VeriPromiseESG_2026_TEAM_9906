@@ -1,6 +1,26 @@
 # Model
 
-## CKIP-BERT v3.1 Update
+## CKIP-BERT v4 ESG MLM
+
+Artifact v4 在既有 RSLoRA 多任務分類前，先對完整
+`ckiplab/bert-base-chinese` 執行 ESG domain-adaptive masked language
+modeling。MLM corpus 僅由以下三個檔案的 `data` 欄位組成：
+
+- `vpesg4k_train_1000 V1.csv`：1,000 筆。
+- `vpesg4k_val_1000.csv`：1,000 筆。
+- `vpesg4k_test_2000.csv`：2,000 筆。
+
+總數固定為 4,000 筆，保留跨檔案重複文本，不讀取 Argument synthetic
+資料或分類標籤。長文本以 512 tokens、64-token overlap 切分；訓練使用
+15% dynamic masking、3 epochs、batch size 4、gradient accumulation 4 與
+learning rate `5e-5`。完成後將 encoder 存至
+`mtl_outputs/mlm_backbone/`，所有 OOF 與 full-data RSLoRA members 共用
+這份 backbone。
+
+外部 `ensemble_inference_and_export(...)`、`id,data` 輸入與五欄提交輸出
+均不變。Inference 支援 v4，並保留 v1、v2、v3 artifact 相容性。
+
+## Previous CKIP-BERT v3.1 Update
 
 Latest 2,000-row competition result:
 
@@ -47,8 +67,8 @@ training or artifact upload.
 
 | 檔案 | 用途 | 模型 artifact |
 |---|---|---|
-| `model_train.ipynb` | CKIP-BERT RSLoRA multi-task 訓練、5-fold OOF 校準與 full-data ensemble | `mtl_outputs/`，artifact v3 |
-| `model_inference.ipynb` | CKIP-BERT v3 ensemble 推論，並相容舊版 v1/v2 checkpoint | `mtl_outputs/` 或 Hugging Face repo |
+| `model_train.ipynb` | ESG MLM、CKIP-BERT RSLoRA multi-task 訓練、5-fold OOF 校準與 full-data ensemble | `mtl_outputs/`，artifact v4 |
+| `model_inference.ipynb` | CKIP-BERT v4 ensemble 推論，並相容舊版 v1/v2/v3 artifact | `mtl_outputs/` 或 Hugging Face repo |
 | `model_setfit.ipynb` | Multi-Task SetFit 5-fold 訓練與 OOF 評估 | `setfit_outputs/` |
 | `model_setfit_inference.ipynb` | SetFit 5-fold soft-voting 推論 | `setfit_outputs/` 或 Hugging Face repo |
 
@@ -61,6 +81,9 @@ CKIP-BERT 與 SetFit 的外部 CSV 介面相同，但 artifact 不相容，必�
 新版 `model_train.ipynb` 讀取：
 
 ```text
+app/data/ori_data/vpesg4k_train_1000 V1.csv
+app/data/ori_data/vpesg4k_val_1000.csv
+app/data/ori_data/vpesg4k_test_2000.csv
 app/data/clean_data/train_fold_1.csv
 ...
 app/data/clean_data/train_fold_5.csv
@@ -143,7 +166,14 @@ Routing 規則：
 
 ## Training Flow
 
-### 1. Five-Fold OOF
+### 1. ESG Masked Language Modeling
+
+1. 以白名單讀取官方 train、val、test 的 4,000 筆 `data`。
+2. 將超過 512 tokens 的文本切成帶 64-token overlap 的 segments。
+3. 使用 15% dynamic masking 更新完整 CKIP-BERT backbone，共 3 epochs。
+4. 儲存 backbone、MLM 設定與每個 epoch 的 loss/perplexity。
+
+### 2. Five-Fold OOF
 
 每個 fold：
 
@@ -159,12 +189,12 @@ Routing 規則：
 - `Misleading` 同時使用 probability threshold 與相對於 Clear/Not Clear 的 margin。
 - `Misleading` threshold 必須令真實非 Misleading OOF false-positive rate 不超過 0.5%，再最大化 synthetic holdout recall。
 
-### 2. Full-Data Ensemble
+### 3. Full-Data Ensemble
 
 - 取五個 fold 最佳 epoch 的中位數作 full-data 訓練 epoch。
 - 使用全部 2,000 筆真實資料與 111 筆 synthetic 資料。
 - 分別使用 seeds `42`、`123`、`2026` 訓練三個模型。
-- 最終 v3 inference 只平均這三個 full-data members 的 calibrated probabilities。
+- 最終 v4 inference 只平均這三個 full-data members 的 calibrated probabilities。
 - 每個 member 儲存後會重新載入，執行 logits save/load parity 檢查。
 
 ## Validation And Baseline Report
@@ -197,10 +227,15 @@ Routing 規則：
 
 目前 repository 只完成程式、靜態測試與資料契約驗證；新版 GPU 訓練尚未執行，因此沒有新版實際 F1。
 
-## CKIP-BERT Artifact V3
+## CKIP-BERT Artifact V4
 
 ```text
 mtl_outputs/
+|-- mlm_backbone/
+|   |-- config.json
+|   `-- model.safetensors
+|-- mlm_config.json
+|-- mlm_training_history.csv
 |-- fold_1/
 |   |-- adapter/
 |   |-- heads.pt
@@ -228,7 +263,8 @@ mtl_outputs/
 
 `mtl_inference_config.json` 會記錄：
 
-- artifact version 與 base model。
+- artifact version、原始 base model 與 MLM backbone 路徑。
+- MLM corpus、mask rate、切分與訓練參數。
 - 三個 ensemble members。
 - LoRA、pooling 與 task class 設定。
 - temperatures、routing thresholds 與 `Misleading` thresholds。
@@ -259,9 +295,10 @@ ensemble_inference_and_export(
 
 Inference notebook 支援：
 
-- v3：下載並 ensemble 三個 LoRA full-data members。
+- v4：下載共用 ESG MLM backbone，並 ensemble 三個 LoRA full-data members。
+- v3：使用原始 Hugging Face base model，並 ensemble 三個 LoRA members。
 - v1/v2：沿用舊版五個 full checkpoint probability ensemble。
-- 遠端 artifact 會先讀取 config 判斷版本；v3 不會下載同 repo 中的大型 legacy checkpoints。
+- 遠端 artifact 會先讀取 config 判斷版本，只下載該版本需要的權重。
 
 上傳前在 training notebook 將：
 
@@ -290,7 +327,10 @@ uv run python -m unittest app.model.test_ckip_lora_notebooks -v
 測試涵蓋：
 
 - Notebook code cell 語法。
-- Artifact v3 關鍵設定。
+- 4,000 筆 MLM corpus 白名單與空值驗證。
+- 512-token overflow chunking 與 64-token overlap。
+- MLM 先於所有分類訓練執行。
+- Artifact v4 backbone 路徑與 v1-v3 相容設定。
 - 官方 timeline alias。
 - T1/T3/T4 routing。
 - `Misleading` probability + margin 決策。

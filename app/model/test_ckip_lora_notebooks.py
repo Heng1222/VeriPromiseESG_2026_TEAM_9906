@@ -1,5 +1,6 @@
 import ast
 import json
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -50,6 +51,7 @@ def load_training_data_contract():
     functions = {
         "normalize_value",
         "read_csv_local_or_remote",
+        "load_mlm_corpus",
         "read_fold_csv",
         "normalize_training_frame",
         "validate_training_frame",
@@ -80,9 +82,109 @@ def load_training_data_contract():
             "evidence_quality",
         ],
         "SYNTHETIC_ID_MIN": 90000,
+        "MLM_CORPUS_FILES": {
+            "train": (
+                Path("ori_data") / "vpesg4k_train_1000 V1.csv",
+                1000,
+            ),
+            "val": (
+                Path("ori_data") / "vpesg4k_val_1000.csv",
+                1000,
+            ),
+            "test": (
+                Path("ori_data") / "vpesg4k_test_2000.csv",
+                2000,
+            ),
+        },
     }
     exec(compile(ast.Module(selected, type_ignores=[]), "<training-data>", "exec"), namespace)
     return namespace
+
+
+def load_mlm_contract():
+    tree = ast.parse(builder.TRAIN_MLM)
+    functions = {"build_mlm_examples"}
+    selected = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in functions
+    ]
+    namespace = {
+        "TEXT_COLUMN": "data",
+        "MLM_MAX_LEN": 8,
+        "MLM_STRIDE": 2,
+        "tqdm": lambda iterable, desc=None: iterable,
+    }
+    exec(compile(ast.Module(selected, type_ignores=[]), "<mlm>", "exec"), namespace)
+    return namespace
+
+
+def load_inference_artifact_contract():
+    tree = ast.parse(builder.INFERENCE_MAIN)
+    assignments = {"DEFAULT_MODEL_NAME"}
+    functions = {"resolve_peft_backbone"}
+    selected = []
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            names = {
+                target.id
+                for target in node.targets
+                if isinstance(target, ast.Name)
+            }
+            if names & assignments:
+                selected.append(node)
+        elif isinstance(node, ast.FunctionDef) and node.name in functions:
+            selected.append(node)
+    namespace = {"Path": Path}
+    exec(
+        compile(
+            ast.Module(selected, type_ignores=[]),
+            "<inference-artifact>",
+            "exec",
+        ),
+        namespace,
+    )
+    return namespace
+
+
+class FakeOverflowTokenizer:
+    def __call__(
+        self,
+        text,
+        add_special_tokens,
+        truncation,
+        max_length,
+        stride,
+        return_overflowing_tokens,
+        return_attention_mask,
+        return_special_tokens_mask,
+    ):
+        del (
+            add_special_tokens,
+            truncation,
+            return_overflowing_tokens,
+            return_attention_mask,
+            return_special_tokens_mask,
+        )
+        body = list(range(10, 10 + len(text)))
+        capacity = max_length - 2
+        chunks = []
+        start = 0
+        while start < len(body):
+            chunk = body[start : start + capacity]
+            ids = [101] + chunk + [102]
+            chunks.append(ids)
+            if start + capacity >= len(body):
+                break
+            start += capacity - stride
+        return {
+            "input_ids": chunks,
+            "attention_mask": [[1] * len(ids) for ids in chunks],
+            "special_tokens_mask": [
+                [1] + [0] * (len(ids) - 2) + [1]
+                for ids in chunks
+            ],
+        }
 
 
 class CKIPLoraNotebookTests(unittest.TestCase):
@@ -90,6 +192,8 @@ class CKIPLoraNotebookTests(unittest.TestCase):
     def setUpClass(cls):
         cls.contract = load_inference_contract()
         cls.training_data = load_training_data_contract()
+        cls.mlm = load_mlm_contract()
+        cls.inference_artifact = load_inference_artifact_contract()
 
     def make_probabilities(self):
         return {
@@ -245,7 +349,63 @@ class CKIPLoraNotebookTests(unittest.TestCase):
         paired = self.training_data["attach_source_pairs"](synthetic, real)
         self.assertEqual(int(paired["pair_valid"].sum()), 105)
 
-    def test_notebooks_are_generated_v3_and_compile(self):
+    def test_mlm_corpus_uses_only_official_4000_data_rows(self):
+        corpus = self.training_data["load_mlm_corpus"]()
+        self.assertEqual(list(corpus.columns), ["data"])
+        self.assertEqual(len(corpus), 4000)
+        self.assertFalse(corpus["data"].isna().any())
+        self.assertTrue(corpus["data"].astype(str).str.strip().ne("").all())
+        corpus_files = self.training_data["MLM_CORPUS_FILES"]
+        self.assertEqual(
+            [rows for _, rows in corpus_files.values()],
+            [1000, 1000, 2000],
+        )
+        self.assertNotIn(
+            "augmented_misleading_data.csv",
+            {path.name for path, _ in corpus_files.values()},
+        )
+
+    def test_mlm_overflow_chunks_keep_configured_overlap(self):
+        corpus = pd.DataFrame({"data": ["abcdefghijkl"]})
+        examples = self.mlm["build_mlm_examples"](
+            corpus,
+            FakeOverflowTokenizer(),
+        )
+        self.assertEqual(len(examples), 3)
+        self.assertTrue(all(len(row["input_ids"]) <= 8 for row in examples))
+        first_body = examples[0]["input_ids"][1:-1]
+        second_body = examples[1]["input_ids"][1:-1]
+        self.assertEqual(first_body[-2:], second_body[:2])
+
+    def test_v4_backbone_resolution_requires_saved_encoder(self):
+        resolve = self.inference_artifact["resolve_peft_backbone"]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            backbone = root / "mlm_backbone"
+            backbone.mkdir()
+            (backbone / "config.json").write_text("{}", encoding="utf-8")
+            self.assertEqual(
+                resolve(
+                    root,
+                    {
+                        "artifact_version": 4,
+                        "backbone_path": "mlm_backbone",
+                    },
+                ),
+                str(backbone),
+            )
+            self.assertEqual(
+                resolve(
+                    root,
+                    {
+                        "artifact_version": 3,
+                        "model_name": "legacy/model",
+                    },
+                ),
+                "legacy/model",
+            )
+
+    def test_notebooks_are_generated_v4_and_compile(self):
         for name in ["model_train.ipynb", "model_inference.ipynb"]:
             notebook = json.loads((MODEL_DIR / name).read_text(encoding="utf-8"))
             for index, cell in enumerate(notebook["cells"]):
@@ -258,7 +418,21 @@ class CKIPLoraNotebookTests(unittest.TestCase):
         train_source = json.dumps(
             json.loads((MODEL_DIR / "model_train.ipynb").read_text(encoding="utf-8"))
         )
-        self.assertIn('"artifact_version\\": 3', train_source)
+        inference_source = json.dumps(
+            json.loads(
+                (MODEL_DIR / "model_inference.ipynb").read_text(
+                    encoding="utf-8"
+                )
+            )
+        )
+        self.assertIn('"artifact_version\\": 4', train_source)
+        self.assertIn("AutoModelForMaskedLM", train_source)
+        self.assertIn("DataCollatorForLanguageModeling", train_source)
+        self.assertIn("return_overflowing_tokens=True", train_source)
+        self.assertIn("MLM_STRIDE = 64", train_source)
+        self.assertIn("MLM_PROBABILITY = 0.15", train_source)
+        self.assertIn("MLM_EPOCHS = 3", train_source)
+        self.assertIn("MLM_BACKBONE_DIR", train_source)
         self.assertIn("use_rslora=True", train_source)
         self.assertIn("assert_save_load_parity", train_source)
         self.assertIn("FULL_DATA_SEEDS = [42, 123, 2026]", train_source)
@@ -275,8 +449,37 @@ class CKIPLoraNotebookTests(unittest.TestCase):
         self.assertIn('t2_class_biases', train_source)
         self.assertIn('t4_not_clear_threshold', train_source)
         self.assertIn('report_quality_metrics', train_source)
+        self.assertIn("mlm_backbone/**", inference_source)
+        self.assertIn("version in {3, 4}", inference_source)
+        self.assertIn("resolve_peft_backbone", inference_source)
         self.assertNotIn('run_quality_gate', train_source)
         self.assertNotIn('Quality gate failed', train_source)
+
+    def test_mlm_executes_before_any_classification_training(self):
+        notebook = builder.build_train_notebook()
+        code_cells = [
+            "".join(cell["source"])
+            for cell in notebook["cells"]
+            if cell["cell_type"] == "code"
+        ]
+        source = "\n".join(code_cells)
+        mlm_run = source.index(
+            "mlm_history, mlm_config = train_mlm_backbone"
+        )
+        fold_run = source.index(
+            'for fold in FOLDS:\n'
+            '    print(f"\\n{\'=\' * 64}\\nTraining fold {fold}'
+        )
+        full_run = source.index(
+            'for seed in FULL_DATA_SEEDS:\n'
+            '    print(f"\\n{\'=\' * 64}\\nTraining full-data seed {seed}'
+        )
+        self.assertLess(mlm_run, fold_run)
+        self.assertLess(mlm_run, full_run)
+        self.assertIn(
+            "ESGLoraMTLModel(MLM_BACKBONE_DIR)",
+            source,
+        )
 
     def test_quality_report_never_blocks_training(self):
         tree = ast.parse(builder.TRAIN_CALIBRATE)
