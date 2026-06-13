@@ -1,89 +1,50 @@
 # Model
 
-## CKIP-BERT v4 ESG MLM
+## Simplified CKIP-BERT Pipeline
 
-Artifact v4 在既有 RSLoRA 多任務分類前，先對完整
-`ckiplab/bert-base-chinese` 執行 ESG domain-adaptive masked language
-modeling。MLM corpus 僅由以下三個檔案的 `data` 欄位組成：
+`model_train.ipynb` now contains only:
 
-- `vpesg4k_train_1000 V1.csv`：1,000 筆。
-- `vpesg4k_val_1000.csv`：1,000 筆。
-- `vpesg4k_test_2000.csv`：2,000 筆。
+1. ESG masked language modeling.
+2. Five CKIP-BERT LoRA classifiers.
+3. One shared MLP.
+4. Four task-specific MLP heads.
+5. Class-weighted cross-entropy loss.
+6. Fixed inference decisions.
 
-總數固定為 4,000 筆，保留跨檔案重複文本，不讀取 Argument synthetic
-資料或分類標籤。長文本以 512 tokens、64-token overlap 切分；訓練使用
-15% dynamic masking、3 epochs、batch size 4、gradient accumulation 4 與
-learning rate `5e-5`。完成後將 encoder 存至
-`mtl_outputs/mlm_backbone/`，所有 OOF 與 full-data RSLoRA members 共用
-這份 backbone。
+Five-fold training and probability ensembling are retained. Temperature
+calibration, class bias tuning, threshold search, focal loss, ordinal loss,
+pair loss, synthetic pairing, and synthetic holdout logic are removed.
 
-外部 `ensemble_inference_and_export(...)`、`id,data` 輸入與五欄提交輸出
-均不變。Inference 支援 v4，並保留 v1、v2、v3 artifact 相容性。
+## Data
 
-## Previous CKIP-BERT v3.1 Update
+### MLM
 
-Latest 2,000-row competition result:
-
-| Task | Macro F1 |
-|---|---:|
-| `promise_status` | `0.7668` |
-| `verification_timeline` | `0.5242` |
-| `evidence_status` | `0.6577` |
-| `evidence_quality` | `0.4093` |
-| Weighted score | `0.5726` |
-
-The saved OOF score was `0.5905`. The largest external gap was
-`evidence_status` (`0.7326` OOF versus `0.6577` competition). The final
-submission also predicted `within_2_years` 114 times, while the OOF truth
-contained only 34 such rows. These diagnostics indicate class-weight and
-full-data training drift rather than a threshold-only problem.
-
-The current notebook generator therefore uses the following v3.1 policy:
-
-- T1/T3 retain effective-number focal loss with `gamma=1.5`.
-- T2/T4 use sqrt-frequency weighted cross entropy with class weights capped
-  at `4.0`; focal loss is disabled for these multiclass tasks.
-- T2 ordinal auxiliary loss is reduced from `0.15` to `0.05`.
-- Synthetic T4 sample weight is reduced from `0.25` to `0.10`.
-- The synthetic/source pair loss is disabled because synthetic holdout recall
-  was high while both real `Misleading` rows still received near-zero
-  probability.
-- Full-data training length is selected by matching the median number of
-  optimizer updates at the fold best checkpoints, instead of copying the
-  median epoch count from 1,600-row fold training to 2,000-row full training.
-- OOF calibration now also stores T2 log-probability class biases and a
-  Clear/Not Clear threshold for T4. Old v3 artifacts remain readable because
-  inference defaults to zero biases and threshold `0.5` when these fields are
-  absent.
-
-The external `ensemble_inference_and_export(...)` signature and the
-`id,data` input / five-column submission output remain unchanged. OOF metrics
-are reported against the historical baselines, but they never block full-data
-training or artifact upload.
-
-此目錄包含 VeriPromiseESG 的模型訓練、推論、評估與 notebook 產生工具。
-
-## Notebooks
-
-| 檔案 | 用途 | 模型 artifact |
-|---|---|---|
-| `model_train.ipynb` | ESG MLM、CKIP-BERT RSLoRA multi-task 訓練、5-fold OOF 校準與 full-data ensemble | `mtl_outputs/`，artifact v4 |
-| `model_inference.ipynb` | CKIP-BERT v4 ensemble 推論，並相容舊版 v1/v2/v3 artifact | `mtl_outputs/` 或 Hugging Face repo |
-| `model_setfit.ipynb` | Multi-Task SetFit 5-fold 訓練與 OOF 評估 | `setfit_outputs/` |
-| `model_setfit_inference.ipynb` | SetFit 5-fold soft-voting 推論 | `setfit_outputs/` 或 Hugging Face repo |
-
-CKIP-BERT 與 SetFit 的外部 CSV 介面相同，但 artifact 不相容，必須使用各自對應的 inference notebook。
-
-## Input And Output
-
-### Training Data
-
-新版 `model_train.ipynb` 讀取：
+MLM uses only the `data` column from:
 
 ```text
 app/data/ori_data/vpesg4k_train_1000 V1.csv
 app/data/ori_data/vpesg4k_val_1000.csv
 app/data/ori_data/vpesg4k_test_2000.csv
+```
+
+This gives 4,000 documents. Argument/synthetic data is excluded.
+
+MLM settings:
+
+- Backbone: `ckiplab/bert-base-chinese`
+- Maximum length: 512
+- Overflow overlap: 64 tokens
+- Dynamic masking: 15%
+- Epochs: 3
+- Batch size: 4
+- Gradient accumulation: 4
+- Learning rate: `5e-5`
+
+### Classification
+
+Classification uses the existing prepared folds:
+
+```text
 app/data/clean_data/train_fold_1.csv
 ...
 app/data/clean_data/train_fold_5.csv
@@ -92,299 +53,116 @@ app/data/clean_data/val_fold_1.csv
 app/data/clean_data/val_fold_5.csv
 ```
 
-資料載入方式與 SetFit notebook 一致，每個 fold 都直接讀取對應的 `train_fold_*.csv` 與 `val_fold_*.csv`。五份互斥的 validation folds 合併為 2,000 筆真實資料；每份 train fold 中重複注入的 111 筆 synthetic `Misleading` 會按 `id` 去重後使用。
+Each train fold contains 1,600 official rows and 111 prepared synthetic
+`Misleading` rows. Each validation fold contains 400 official rows. Synthetic
+rows are treated as ordinary classification samples; there is no special
+pairing, holdout, loss, or routing rule.
 
-每個 fold 訓練時直接採用該 `train_fold` 中的 1,600 筆真實資料，再依 synthetic source-group holdout 規則加入四份 synthetic groups；validation 則直接使用該 `val_fold` 的 400 筆真實資料。
-
-必要欄位：
+## Model
 
 ```text
-id,data,promise_status,verification_timeline,evidence_status,evidence_quality
+ESG MLM backbone
+  -> LoRA
+  -> CLS representation
+  -> shared MLP: hidden_size -> 256
+  -> four task heads: 256 -> 128 -> output
 ```
 
-Synthetic 配對使用 `pdf_url` 與 `promise_string`；source group 則使用 `pdf_url` 與 `page_number`。目前 111 筆中有 105 筆可配回原始 Clear 樣本；37 個 synthetic source groups 會完整分配到單一 fold，避免同來源變體同時出現在訓練與 auxiliary validation。
+Each task uses weighted cross-entropy. Every fold derives its weights from its
+own training split:
 
-### Inference Input
+```text
+weight = min((largest_class_count / class_count) ** 0.5, 5.0)
+```
 
-`model_inference.ipynb` 最少只要求：
+The square-root weighting raises rare-class importance without the instability
+of full inverse-frequency weighting. Losses from tasks that have valid labels
+in the current batch are averaged equally.
+
+One model is trained for each fold. The fold validation macro-F1 selects the
+best epoch with early stopping. Inference averages the five models' softmax
+probabilities before applying the fixed prediction rules.
+
+## Prediction Rules
+
+- T1 `promise_status`: predict `Yes` when `P(Yes) >= 0.5`.
+- T2 `verification_timeline`: use softmax argmax.
+- T3 `evidence_status`: predict `Yes` when `P(Yes) >= 0.5`.
+- T4 `evidence_quality`: use softmax argmax.
+- If T1 is `No`, T2-T4 are `N/A`.
+- If T1 is `Yes` and T3 is `No`, T4 is `N/A`.
+
+A threshold of 0.5 is appropriate for the binary T1 and T3 tasks. T2 and T4
+are multiclass tasks, so argmax is the normal fixed decision rule.
+
+## Artifact
+
+```text
+mtl_outputs/
+|-- mlm_backbone/
+|-- tokenizer/
+|-- fold_1/
+|   |-- adapter/
+|   |-- heads.pt
+|   `-- metadata.json
+|-- ...
+|-- fold_5/
+|-- mlm_config.json
+|-- mlm_training_history.csv
+|-- training_history.csv
+|-- oof_predictions.csv
+`-- mtl_inference_config.json
+```
+
+Artifact v6 intentionally supports the simplified five-fold model.
+
+## Inference
+
+Local artifact:
+
+```python
+inference_and_export(
+    repo_id=None,
+    test_csv_path="../data/ori_data/vpesg4k_test_2000.csv",
+    output_csv_path="final_submission.csv",
+    model_dir="mtl_outputs",
+)
+```
+
+Hugging Face artifact:
+
+```python
+inference_and_export(
+    repo_id="maxbeettww/VeriPromise_ESG_2026_9906",
+    test_csv_path="../data/ori_data/vpesg4k_test_2000.csv",
+    output_csv_path="final_submission.csv",
+)
+```
+
+Input:
 
 ```text
 id,data
 ```
 
-- `id` 不可重複。
-- 其他欄位可以存在，但不會加入模型輸入。
-- 輸出列數與 `id` 順序和輸入完全一致。
-
-### Prediction Output
+Output:
 
 ```text
 id,promise_status,verification_timeline,evidence_status,evidence_quality
 ```
 
-Routing 規則：
+## Maintenance
 
-- `promise_status=No` 時，T2、T3、T4 輸出 `N/A`。
-- `promise_status=Yes` 且 `evidence_status=No` 時，T4 輸出 `N/A`。
-- 官方 T2 長期標籤是 `more_than_5_years`。
-- 新版 CKIP-BERT inference 會把舊資料或舊 artifact 中的 `longer_than_5_years` 轉成官方值後匯出。
-
-輸出前會檢查欄位順序、合法標籤、routing、列數與 ID 順序。預設輸出檔名為 `final_submission.csv`。
-
-## CKIP-BERT LoRA Training
-
-### Model
-
-- Backbone：`ckiplab/bert-base-chinese`。
-- 使用 PEFT RSLoRA，套用所有 Transformer linear layers。
-- LoRA 設定：`r=8`、`alpha=16`、dropout `0.1`、`use_rslora=True`。
-- 文字只使用 `data`，訓練與推論共用 head-tail truncation，最大長度 512。
-- Pooling：`CLS + masked mean + masked max`，合併後維度為 2304。
-- Shared MLP：`2304 -> 384 -> 256`。
-- 四個 task heads：`256 -> 128 -> output`，全部使用 multi-sample dropout。
-
-### Objectives
-
-- T1-T4 使用 effective-number class-balanced focal loss，`gamma=1.5`，class weight 上限為 6。
-- Competition task weights：
-  - T1 `0.20`
-  - T2 `0.15`
-  - T3 `0.30`
-  - T4 `0.35`
-- T2 額外加入權重 `0.15` 的 ordinal expected-distance loss。
-- Synthetic T4 sample weight 為 `0.25`。
-- 可配對的 synthetic/原始 Clear 樣本加入權重 `0.05` 的 cosine-margin loss。
-- Synthetic rows 不參與 T1-T3 loss。
-
-### Optimization
-
-- LoRA learning rate：`1e-4`。
-- Shared MLP 與 task heads learning rate：`3e-4`。
-- Batch size 8，gradient accumulation 2，effective batch size 16。
-- 最多 12 epochs，early stopping patience 3。
-- Warmup 10%、cosine decay、AMP 與 gradient clipping 1.0。
-
-## Training Flow
-
-### 1. ESG Masked Language Modeling
-
-1. 以白名單讀取官方 train、val、test 的 4,000 筆 `data`。
-2. 將超過 512 tokens 的文本切成帶 64-token overlap 的 segments。
-3. 使用 15% dynamic masking 更新完整 CKIP-BERT backbone，共 3 epochs。
-4. 儲存 backbone、MLM 設定與每個 epoch 的 loss/perplexity。
-
-### 2. Five-Fold OOF
-
-每個 fold：
-
-1. 使用約 1,600 筆真實資料與四份 synthetic source groups 訓練。
-2. 使用 400 筆真實 validation 選擇 competition macro-F1 最佳 epoch。
-3. 保留一份 synthetic source groups 作 auxiliary holdout。
-4. 儲存 LoRA adapter、MLP heads、training history 與 OOF logits。
-
-完成五 folds 後：
-
-- 使用 OOF logits 為四個任務分別估計 scalar temperature。
-- T1/T3 threshold 以 `mean fold score - 0.25 * fold std` 為搜尋目標。
-- `Misleading` 同時使用 probability threshold 與相對於 Clear/Not Clear 的 margin。
-- `Misleading` threshold 必須令真實非 Misleading OOF false-positive rate 不超過 0.5%，再最大化 synthetic holdout recall。
-
-### 3. Full-Data Ensemble
-
-- 取五個 fold 最佳 epoch 的中位數作 full-data 訓練 epoch。
-- 使用全部 2,000 筆真實資料與 111 筆 synthetic 資料。
-- 分別使用 seeds `42`、`123`、`2026` 訓練三個模型。
-- 最終 v4 inference 只平均這三個 full-data members 的 calibrated probabilities。
-- 每個 member 儲存後會重新載入，執行 logits save/load parity 檢查。
-
-## Validation And Baseline Report
-
-訓練 notebook 會輸出：
-
-- Overall OOF competition score。
-- 官方 train 1,000、官方 val 1,000 與每個 fold 的 task macro F1。
-- Per-class classification report、confusion matrix 與 prediction distribution。
-- T4 direct/routed macro F1。
-- 兩筆真實 `Misleading` 的 probabilities 與 prediction。
-- Synthetic holdout recall 與真實非 Misleading false-positive rate。
-
-比較基準來自舊版 OOF：
-
-| 指標 | 基準 |
-|---|---:|
-| Competition | `0.601140` |
-| T1 | `0.754363` |
-| T2 | `0.565558` |
-| T3 | `0.724977` |
-| T4 | `0.422687` |
-
-這些基準只用於診斷：
-
-- Competition 低於 `0.601140` 時印出 warning。
-- T1、T2、T3 比各自基準下降超過 `0.02` 時印出 warning。
-- T4 未改善且未以較低 `Misleading` false-positive rate 維持基準時印出 warning。
-- 所有 warning 都不會中止 notebook；full-data ensemble、artifact validation 與 upload 仍會繼續。
-
-目前 repository 只完成程式、靜態測試與資料契約驗證；新版 GPU 訓練尚未執行，因此沒有新版實際 F1。
-
-## CKIP-BERT Artifact V4
-
-```text
-mtl_outputs/
-|-- mlm_backbone/
-|   |-- config.json
-|   `-- model.safetensors
-|-- mlm_config.json
-|-- mlm_training_history.csv
-|-- fold_1/
-|   |-- adapter/
-|   |-- heads.pt
-|   |-- metadata.json
-|   `-- training_history.csv
-|-- ...
-|-- fold_5/
-|-- full_seed_42/
-|   |-- adapter/
-|   |-- heads.pt
-|   |-- metadata.json
-|   `-- training_history.csv
-|-- full_seed_123/
-|-- full_seed_2026/
-|-- tokenizer/
-|-- mtl_inference_config.json
-|-- mtl_calibration.json
-|-- mtl_thresholds.json
-|-- mtl_oof_logits.csv
-|-- mtl_oof_probabilities.csv
-|-- mtl_oof_predictions.csv
-|-- mtl_synthetic_holdout_logits.csv
-`-- training_history.csv
-```
-
-`mtl_inference_config.json` 會記錄：
-
-- artifact version、原始 base model 與 MLM backbone 路徑。
-- MLM corpus、mask rate、切分與訓練參數。
-- 三個 ensemble members。
-- LoRA、pooling 與 task class 設定。
-- temperatures、routing thresholds 與 `Misleading` thresholds。
-- quality metrics 與 synthetic policy。
-
-## CKIP-BERT Inference
-
-本機 artifact：
-
-```python
-ensemble_inference_and_export(
-    repo_id=None,
-    test_csv_path="/content/test.csv",
-    output_csv_path="final_submission.csv",
-    model_dir="/content/mtl_outputs",
-)
-```
-
-Hugging Face artifact：
-
-```python
-ensemble_inference_and_export(
-    repo_id="maxbeettww/VeriPromise_ESG_2026_9906",
-    test_csv_path="/content/test.csv",
-    output_csv_path="final_submission.csv",
-)
-```
-
-Inference notebook 支援：
-
-- v4：下載共用 ESG MLM backbone，並 ensemble 三個 LoRA full-data members。
-- v3：使用原始 Hugging Face base model，並 ensemble 三個 LoRA members。
-- v1/v2：沿用舊版五個 full checkpoint probability ensemble。
-- 遠端 artifact 會先讀取 config 判斷版本，只下載該版本需要的權重。
-
-上傳前在 training notebook 將：
-
-```python
-RUN_HF_UPLOAD = True
-```
-
-預設為 `False`，避免訓練完成前覆寫既有 Hugging Face artifact。
-
-## Notebook Maintenance And Tests
-
-兩個 CKIP-BERT notebook 由可 review 的 Python 來源產生：
+Regenerate notebooks:
 
 ```powershell
 uv run python app/model/build_ckip_lora_notebooks.py
 ```
 
-修改產生器後必須重新執行，將內容同步到 `.ipynb`。
-
-核心 contract 測試：
+Run contract tests:
 
 ```powershell
 uv run python -m unittest app.model.test_ckip_lora_notebooks -v
 ```
 
-測試涵蓋：
-
-- Notebook code cell 語法。
-- 4,000 筆 MLM corpus 白名單與空值驗證。
-- 512-token overflow chunking 與 64-token overlap。
-- MLM 先於所有分類訓練執行。
-- Artifact v4 backbone 路徑與 v1-v3 相容設定。
-- 官方 timeline alias。
-- T1/T3/T4 routing。
-- `Misleading` probability + margin 決策。
-- Submission schema 與合法值。
-- 37 個 synthetic source groups 的 fold 隔離。
-- 105 筆 synthetic/source 配對。
-
-## SetFit
-
-`model_setfit.ipynb` 與 `model_setfit_inference.ipynb` 維持既有 artifact v2 流程：
-
-- Backbone：`BAAI/bge-base-zh-v1.5`。
-- T1-T4 共用 SentenceTransformer encoder。
-- 五個 fold probability soft voting。
-- 每個 task head 依 validation macro F1 選擇。
-- T2 支援 ordinal cumulative logistic head。
-- T4 支援 MLP head 與 synthetic sample weighting。
-- 推論套用 T1/T3 thresholds 與相同階層 routing。
-
-已知相容性限制：目前 SetFit 內部及匯出仍使用 legacy T2 標籤 `longer_than_5_years`，尚未套用 CKIP-BERT v3 的官方 `more_than_5_years` 匯出正規化。提交 SetFit 結果前必須先修正或後處理該欄位。
-
-SetFit artifact：
-
-```text
-setfit_outputs/
-|-- fold_1/
-|   |-- encoder/
-|   `-- task_heads.joblib
-|-- ...
-|-- fold_5/
-|-- setfit_thresholds.json
-|-- setfit_inference_config.json
-|-- setfit_oof_predictions.csv
-|-- setfit_oof_probabilities.csv
-`-- README.md
-```
-
-本機推論：
-
-```python
-ensemble_inference_and_export(
-    repo_id=None,
-    test_csv_path="/content/test.csv",
-    output_csv_path="final_submission.csv",
-    model_dir="/content/setfit_outputs",
-)
-```
-
-Hugging Face artifact：
-
-```python
-ensemble_inference_and_export(
-    repo_id="maxbeettww/VeriPromise_ESG_2026_9906_SetFit",
-    test_csv_path="/content/test.csv",
-    output_csv_path="final_submission.csv",
-)
-```
+The SetFit notebooks remain separate and use their own artifact format.
