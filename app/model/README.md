@@ -64,14 +64,10 @@ pairing, holdout, loss, or routing rule.
 ```text
 ESG MLM backbone
   -> LoRA
-  -> CLS + masked mean pooling
-  -> shared MLP: hidden_size*2 -> 512 -> 256
+  -> CLS representation
+  -> shared MLP: hidden_size -> 256
   -> four task heads: 256 -> 128 -> output
 ```
-
-The pooled representation combines the document-level CLS token with the
-average of all non-padding token states. This gives the heads direct access to
-whole-document information without requesting all hidden layers.
 
 Each task uses weighted cross-entropy. Every fold derives its weights from its
 own training split:
@@ -84,11 +80,11 @@ The square-root weighting raises rare-class importance without the instability
 of full inverse-frequency weighting. Losses from tasks that have valid labels
 in the current batch are averaged equally.
 
-One model is trained for each fold for at most 30 epochs. It trains for at
-least 12 epochs, then stops after 6 non-improving epochs. The fold validation
-macro-F1 selects the best checkpoint.
+One model is trained for each fold for at most 30 epochs and stops after 5
+non-improving epochs. The checkpoint score uses the official competition
+weights: T1 20%, T2 15%, T3 30%, and T4 35%.
 
-LoRA parameters use a `3e-5` learning rate while the newly initialized shared
+LoRA parameters use a `5e-5` learning rate while the newly initialized shared
 MLP and task heads use `1e-4`. Both groups use 8% warmup and cosine decay.
 This keeps the longer run conservative for the pretrained backbone while
 allowing the classification layers to learn faster. Inference averages the
@@ -126,8 +122,8 @@ mtl_outputs/
 `-- mtl_inference_config.json
 ```
 
-Artifact v7 contains the dual-pooling head and is intentionally incompatible
-with older v6 head weights.
+Artifact v8 restores the smaller CLS-only head after the dual-pooling v7
+experiment regressed. It is intentionally incompatible with v7 head weights.
 
 ## Inference
 

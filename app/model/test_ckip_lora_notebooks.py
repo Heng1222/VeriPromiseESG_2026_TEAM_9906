@@ -258,12 +258,12 @@ class SimplifiedCKIPNotebookTests(unittest.TestCase):
             "".join(cell["source"])
             for cell in builder.build_inference_notebook()["cells"]
         )
-        self.assertIn('"artifact_version": 7', train_source)
+        self.assertIn('"artifact_version": 8', train_source)
         self.assertIn("AutoModelForMaskedLM", train_source)
         self.assertIn("get_peft_model", train_source)
         self.assertIn("self.shared_mlp", train_source)
         self.assertIn("self.heads", train_source)
-        self.assertIn("torch.cat([cls_pool, mean_pool], dim=-1)", train_source)
+        self.assertIn("self.shared_mlp(hidden[:, 0, :])", train_source)
         self.assertIn("F.cross_entropy", train_source)
         self.assertIn('"t1_yes": T1_THRESHOLD', train_source)
         self.assertIn('"t3_yes": T3_THRESHOLD', train_source)
@@ -272,33 +272,43 @@ class SimplifiedCKIPNotebookTests(unittest.TestCase):
         self.assertIn("weight=class_weights[task]", train_source)
         self.assertIn('"ensemble_members": [', train_source)
         self.assertIn("ensemble_probabilities", inference_source)
-        self.assertIn("only supports simplified artifact v7", inference_source)
+        self.assertIn("only supports simplified artifact v8", inference_source)
 
     def test_long_training_uses_differential_learning_rates(self):
         source = builder.TRAIN_CONFIG + builder.TRAIN_CLASSIFIER
         self.assertIn("MLM_EPOCHS = 6", source)
         self.assertIn("MLM_LR = 3e-5", source)
         self.assertIn("MAX_EPOCHS = 30", source)
-        self.assertIn("MIN_EPOCHS = 12", source)
-        self.assertIn("EARLY_STOPPING_PATIENCE = 6", source)
+        self.assertIn("EARLY_STOPPING_PATIENCE = 5", source)
+        self.assertIn("LORA_LEARNING_RATE = 5e-5", source)
         self.assertIn('"lr": LORA_LEARNING_RATE', source)
         self.assertIn('"lr": HEAD_LEARNING_RATE', source)
-        self.assertIn("epoch >= MIN_EPOCHS", source)
         self.assertIn('"lora_learning_rate": current_lrs[0]', source)
         self.assertIn('"head_learning_rate": current_lrs[1]', source)
 
-    def test_dual_pool_head_matches_inference(self):
+    def test_cls_head_matches_inference(self):
         train_source = builder.TRAIN_CLASSIFIER
         inference_source = builder.INFERENCE_MAIN
         expected = [
-            "nn.Linear(hidden_size * 2, 512)",
-            "nn.Linear(512, 256)",
-            "token_mask = attention_mask.unsqueeze(-1).to(hidden.dtype)",
-            "torch.cat([cls_pool, mean_pool], dim=-1)",
+            "nn.Linear(hidden_size, 256)",
+            "nn.Linear(256, 128)",
+            "self.shared_mlp(hidden[:, 0, :])",
         ]
         for token in expected:
             self.assertIn(token, train_source)
             self.assertIn(token, inference_source)
+
+    def test_checkpoint_uses_competition_score_weights(self):
+        source = builder.TRAIN_CONFIG + builder.TRAIN_CLASSIFIER
+        self.assertIn('"promise_status": 0.20', source)
+        self.assertIn('"verification_timeline": 0.15', source)
+        self.assertIn('"evidence_status": 0.30', source)
+        self.assertIn('"evidence_quality": 0.35', source)
+        self.assertIn('scores["competition_macro_f1"]', source)
+        self.assertIn(
+            'metrics["competition_macro_f1"] > best_score',
+            source,
+        )
 
     def test_complex_training_features_are_removed(self):
         source = "\n".join(
