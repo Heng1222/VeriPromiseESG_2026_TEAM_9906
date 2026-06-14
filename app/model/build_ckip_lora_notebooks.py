@@ -69,18 +69,21 @@ MLM_STRIDE = 64
 MLM_PROBABILITY = 0.15
 MLM_BATCH_SIZE = 4
 MLM_GRAD_ACCUM_STEPS = 4
-MLM_EPOCHS = 3
-MLM_LR = 5e-5
+MLM_EPOCHS = 6
+MLM_LR = 3e-5
 
 MAX_LEN = 512
 HEAD_RATIO = 0.25
 BATCH_SIZE = 8
 GRAD_ACCUM_STEPS = 2
-MAX_EPOCHS = 12
-EARLY_STOPPING_PATIENCE = 3
-LEARNING_RATE = 1e-4
+MAX_EPOCHS = 30
+MIN_EPOCHS = 12
+EARLY_STOPPING_PATIENCE = 6
+MIN_F1_IMPROVEMENT = 1e-4
+LORA_LEARNING_RATE = 3e-5
+HEAD_LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 0.01
-WARMUP_RATIO = 0.10
+WARMUP_RATIO = 0.08
 MAX_GRAD_NORM = 1.0
 CLASS_WEIGHT_POWER = 0.5
 MAX_CLASS_WEIGHT = 5.0
@@ -435,6 +438,7 @@ def train_mlm_backbone(corpus, tokenizer):
             "epoch": epoch,
             "train_loss": train_loss,
             "perplexity": math.exp(min(train_loss, 20.0)),
+            "learning_rate": scheduler.get_last_lr()[0],
         }
         history.append(row)
         print(pd.DataFrame([row]).to_string(index=False))
@@ -458,6 +462,8 @@ def train_mlm_backbone(corpus, tokenizer):
         "batch_size": MLM_BATCH_SIZE,
         "gradient_accumulation_steps": MLM_GRAD_ACCUM_STEPS,
         "learning_rate": MLM_LR,
+        "warmup_ratio": WARMUP_RATIO,
+        "weight_decay": WEIGHT_DECAY,
         "corpus": {
             split: {
                 "path": path.as_posix(),
@@ -511,17 +517,21 @@ class SimpleESGModel(nn.Module):
             )
         hidden_size = base_model.config.hidden_size
         self.shared_mlp = nn.Sequential(
-            nn.Linear(hidden_size, 256),
+            nn.Linear(hidden_size * 2, 512),
+            nn.LayerNorm(512),
+            nn.GELU(),
+            nn.Dropout(0.20),
+            nn.Linear(512, 256),
             nn.LayerNorm(256),
             nn.GELU(),
-            nn.Dropout(0.10),
+            nn.Dropout(0.15),
         )
         self.heads = nn.ModuleDict(
             {
                 task: nn.Sequential(
                     nn.Linear(256, 128),
                     nn.GELU(),
-                    nn.Dropout(0.10),
+                    nn.Dropout(0.15),
                     nn.Linear(128, len(labels)),
                 )
                 for task, labels in TASK_CLASSES.items()
@@ -534,7 +544,13 @@ class SimpleESGModel(nn.Module):
             attention_mask=attention_mask,
             return_dict=True,
         ).last_hidden_state
-        features = self.shared_mlp(hidden[:, 0, :])
+        token_mask = attention_mask.unsqueeze(-1).to(hidden.dtype)
+        mean_pool = (hidden * token_mask).sum(dim=1)
+        mean_pool = mean_pool / token_mask.sum(dim=1).clamp(min=1.0)
+        cls_pool = hidden[:, 0, :]
+        features = self.shared_mlp(
+            torch.cat([cls_pool, mean_pool], dim=-1)
+        )
         return {
             task: head(features)
             for task, head in self.heads.items()
@@ -776,14 +792,28 @@ def train_classifier(fold, train_df, val_df, tokenizer):
     class_weights = compute_class_weights(train_df)
     model = SimpleESGModel(MLM_BACKBONE_DIR).to(DEVICE)
     model.backbone.print_trainable_parameters()
-    trainable_parameters = [
+    lora_parameters = [
         parameter
-        for parameter in model.parameters()
+        for parameter in model.backbone.parameters()
         if parameter.requires_grad
     ]
+    head_parameters = [
+        parameter
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad and not name.startswith("backbone.")
+    ]
+    trainable_parameters = lora_parameters + head_parameters
     optimizer = torch.optim.AdamW(
-        trainable_parameters,
-        lr=LEARNING_RATE,
+        [
+            {
+                "params": lora_parameters,
+                "lr": LORA_LEARNING_RATE,
+            },
+            {
+                "params": head_parameters,
+                "lr": HEAD_LEARNING_RATE,
+            },
+        ],
         weight_decay=WEIGHT_DECAY,
     )
     steps_per_epoch = math.ceil(len(train_loader) / GRAD_ACCUM_STEPS)
@@ -837,28 +867,39 @@ def train_classifier(fold, train_df, val_df, tokenizer):
         probabilities = predict_probabilities(model, val_loader)
         predictions = route_predictions(val_df, probabilities)
         metrics = evaluate_predictions(val_df, predictions)
+        current_lrs = scheduler.get_last_lr()
         row = {
             "fold": fold,
             "epoch": epoch,
             "train_loss": train_loss_sum / len(train_loader),
             "val_loss": val_loss,
+            "lora_learning_rate": current_lrs[0],
+            "head_learning_rate": current_lrs[1],
             **metrics,
         }
         history.append(row)
         print(pd.DataFrame([row]).to_string(index=False))
 
-        if metrics["mean_macro_f1"] > best_score:
+        if metrics["mean_macro_f1"] > best_score + MIN_F1_IMPROVEMENT:
             best_score = metrics["mean_macro_f1"]
             epochs_without_improvement = 0
             save_classifier(
                 model,
                 fold_dir,
                 {
-                    "artifact_version": 6,
+                    "artifact_version": 7,
                     "fold": fold,
                     "best_epoch": epoch,
                     "best_val_loss": val_loss,
                     "best_mean_macro_f1": best_score,
+                    "max_epochs": MAX_EPOCHS,
+                    "min_epochs": MIN_EPOCHS,
+                    "early_stopping_patience": EARLY_STOPPING_PATIENCE,
+                    "min_f1_improvement": MIN_F1_IMPROVEMENT,
+                    "lora_learning_rate": LORA_LEARNING_RATE,
+                    "head_learning_rate": HEAD_LEARNING_RATE,
+                    "warmup_ratio": WARMUP_RATIO,
+                    "weight_decay": WEIGHT_DECAY,
                     "class_weights": {
                         task: weights.detach().cpu().tolist()
                         for task, weights in class_weights.items()
@@ -867,7 +908,10 @@ def train_classifier(fold, train_df, val_df, tokenizer):
             )
         else:
             epochs_without_improvement += 1
-            if epochs_without_improvement >= EARLY_STOPPING_PATIENCE:
+            if (
+                epoch >= MIN_EPOCHS
+                and epochs_without_improvement >= EARLY_STOPPING_PATIENCE
+            ):
                 print(f"Early stopping after epoch {epoch}.")
                 break
 
@@ -954,8 +998,8 @@ TRAIN_ARTIFACT = r'''# ==========================================
 
 def save_inference_config():
     config = {
-        "artifact_version": 6,
-        "model_type": "ckip_bert_mlm_lora_shared_mlp",
+        "artifact_version": 7,
+        "model_type": "ckip_bert_mlm_lora_dual_pool_mlp",
         "model_name": MODEL_NAME,
         "backbone_path": MLM_BACKBONE_DIR.name,
         "ensemble_members": [f"fold_{fold}" for fold in FOLDS],
@@ -976,9 +1020,21 @@ def save_inference_config():
             "task_aggregation": "equal_mean",
         },
         "architecture": {
-            "pooling": "cls",
-            "shared_mlp": "hidden_size -> 256",
+            "pooling": "cls_plus_masked_mean",
+            "shared_mlp": "hidden_size*2 -> 512 -> 256",
             "task_heads": "256 -> 128 -> output",
+            "shared_dropout": [0.20, 0.15],
+            "head_dropout": 0.15,
+        },
+        "classification_training": {
+            "max_epochs": MAX_EPOCHS,
+            "min_epochs": MIN_EPOCHS,
+            "early_stopping_patience": EARLY_STOPPING_PATIENCE,
+            "min_f1_improvement": MIN_F1_IMPROVEMENT,
+            "lora_learning_rate": LORA_LEARNING_RATE,
+            "head_learning_rate": HEAD_LEARNING_RATE,
+            "warmup_ratio": WARMUP_RATIO,
+            "weight_decay": WEIGHT_DECAY,
         },
         "mlm": mlm_config,
         "fold_metrics": fold_metrics,
@@ -1071,7 +1127,7 @@ from transformers import AutoModel, AutoTokenizer
 
 
 # ==========================================
-# Simplified five-fold artifact v6 inference
+# Simplified five-fold artifact v7 inference
 # ==========================================
 
 DEFAULT_REPO_ID = "maxbeettww/VeriPromise_ESG_2026_9906"
@@ -1148,8 +1204,8 @@ def load_config(root):
         encoding="utf-8",
     ) as file:
         config = json.load(file)
-    if int(config.get("artifact_version", 0)) != 6:
-        raise ValueError("This notebook only supports simplified artifact v6.")
+    if int(config.get("artifact_version", 0)) != 7:
+        raise ValueError("This notebook only supports simplified artifact v7.")
     return config
 
 
@@ -1208,17 +1264,21 @@ class SimpleESGModel(nn.Module):
         )
         hidden_size = base_model.config.hidden_size
         self.shared_mlp = nn.Sequential(
-            nn.Linear(hidden_size, 256),
+            nn.Linear(hidden_size * 2, 512),
+            nn.LayerNorm(512),
+            nn.GELU(),
+            nn.Dropout(0.20),
+            nn.Linear(512, 256),
             nn.LayerNorm(256),
             nn.GELU(),
-            nn.Dropout(0.10),
+            nn.Dropout(0.15),
         )
         self.heads = nn.ModuleDict(
             {
                 task: nn.Sequential(
                     nn.Linear(256, 128),
                     nn.GELU(),
-                    nn.Dropout(0.10),
+                    nn.Dropout(0.15),
                     nn.Linear(128, len(labels)),
                 )
                 for task, labels in TASK_CLASSES.items()
@@ -1231,7 +1291,13 @@ class SimpleESGModel(nn.Module):
             attention_mask=attention_mask,
             return_dict=True,
         ).last_hidden_state
-        features = self.shared_mlp(hidden[:, 0, :])
+        token_mask = attention_mask.unsqueeze(-1).to(hidden.dtype)
+        mean_pool = (hidden * token_mask).sum(dim=1)
+        mean_pool = mean_pool / token_mask.sum(dim=1).clamp(min=1.0)
+        cls_pool = hidden[:, 0, :]
+        features = self.shared_mlp(
+            torch.cat([cls_pool, mean_pool], dim=-1)
+        )
         return {
             task: head(features)
             for task, head in self.heads.items()
@@ -1269,7 +1335,7 @@ def predict_probabilities(model, loader):
 def ensemble_probabilities(root, config, loader):
     members = config.get("ensemble_members", [])
     if len(members) != 5:
-        raise ValueError("Artifact v6 must contain five ensemble members.")
+        raise ValueError("Artifact v7 must contain five ensemble members.")
     accumulated = {task: None for task in TASK_CLASSES}
     for member in members:
         member_dir = Path(root) / member

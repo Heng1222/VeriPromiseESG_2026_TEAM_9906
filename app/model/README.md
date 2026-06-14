@@ -35,10 +35,11 @@ MLM settings:
 - Maximum length: 512
 - Overflow overlap: 64 tokens
 - Dynamic masking: 15%
-- Epochs: 3
+- Epochs: 6
 - Batch size: 4
 - Gradient accumulation: 4
-- Learning rate: `5e-5`
+- Learning rate: `3e-5`
+- Scheduler: 8% warmup followed by cosine decay
 
 ### Classification
 
@@ -63,10 +64,14 @@ pairing, holdout, loss, or routing rule.
 ```text
 ESG MLM backbone
   -> LoRA
-  -> CLS representation
-  -> shared MLP: hidden_size -> 256
+  -> CLS + masked mean pooling
+  -> shared MLP: hidden_size*2 -> 512 -> 256
   -> four task heads: 256 -> 128 -> output
 ```
+
+The pooled representation combines the document-level CLS token with the
+average of all non-padding token states. This gives the heads direct access to
+whole-document information without requesting all hidden layers.
 
 Each task uses weighted cross-entropy. Every fold derives its weights from its
 own training split:
@@ -79,9 +84,16 @@ The square-root weighting raises rare-class importance without the instability
 of full inverse-frequency weighting. Losses from tasks that have valid labels
 in the current batch are averaged equally.
 
-One model is trained for each fold. The fold validation macro-F1 selects the
-best epoch with early stopping. Inference averages the five models' softmax
-probabilities before applying the fixed prediction rules.
+One model is trained for each fold for at most 30 epochs. It trains for at
+least 12 epochs, then stops after 6 non-improving epochs. The fold validation
+macro-F1 selects the best checkpoint.
+
+LoRA parameters use a `3e-5` learning rate while the newly initialized shared
+MLP and task heads use `1e-4`. Both groups use 8% warmup and cosine decay.
+This keeps the longer run conservative for the pretrained backbone while
+allowing the classification layers to learn faster. Inference averages the
+five models' softmax probabilities before applying the fixed prediction
+rules.
 
 ## Prediction Rules
 
@@ -114,7 +126,8 @@ mtl_outputs/
 `-- mtl_inference_config.json
 ```
 
-Artifact v6 intentionally supports the simplified five-fold model.
+Artifact v7 contains the dual-pooling head and is intentionally incompatible
+with older v6 head weights.
 
 ## Inference
 
