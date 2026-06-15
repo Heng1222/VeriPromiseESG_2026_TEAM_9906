@@ -1,10 +1,13 @@
 import ast
+import io
 import json
 import unittest
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import torch
+import torch.nn as nn
 
 from app.model import build_ckip_lora_notebooks as builder
 
@@ -107,6 +110,24 @@ def load_inference_contract():
             "TARGET_COLUMNS",
             "TASK_CLASSES",
         },
+        namespace=namespace,
+    )
+
+
+def load_model_components(source):
+    namespace = {
+        "torch": torch,
+        "nn": nn,
+    }
+    return selected_namespace(
+        source,
+        functions={
+            "LearnableLayerPool",
+            "ResidualAdapter",
+            "SharedFeatureMLP",
+            "TaskHead",
+        },
+        assignments=set(),
         namespace=namespace,
     )
 
@@ -239,12 +260,21 @@ class SimplifiedCKIPNotebookTests(unittest.TestCase):
         self.assertEqual(output.loc[2, "promise_status"], "No")
 
     def test_notebooks_compile_and_use_simple_artifact(self):
-        for name in ["model_train.ipynb", "model_inference.ipynb"]:
+        expected_notebooks = {
+            "model_train.ipynb": builder.build_train_notebook(),
+            "model_inference.ipynb": builder.build_inference_notebook(),
+        }
+        for name, expected_notebook in expected_notebooks.items():
             notebook = json.loads(
                 (MODEL_DIR / name).read_text(encoding="utf-8")
             )
+            for cell in notebook["cells"]:
+                cell.pop("id", None)
+            self.assertEqual(notebook, expected_notebook)
             for index, cell in enumerate(notebook["cells"]):
                 if cell["cell_type"] == "code":
+                    self.assertIsNone(cell["execution_count"])
+                    self.assertEqual(cell["outputs"], [])
                     compile(
                         "".join(cell["source"]),
                         f"{name}:cell{index}",
@@ -258,12 +288,17 @@ class SimplifiedCKIPNotebookTests(unittest.TestCase):
             "".join(cell["source"])
             for cell in builder.build_inference_notebook()["cells"]
         )
-        self.assertIn('"artifact_version": 8', train_source)
+        self.assertIn('"artifact_version": 9', train_source)
         self.assertIn("AutoModelForMaskedLM", train_source)
         self.assertIn("get_peft_model", train_source)
+        self.assertIn("self.layer_pooler", train_source)
         self.assertIn("self.shared_mlp", train_source)
         self.assertIn("self.heads", train_source)
-        self.assertIn("self.shared_mlp(hidden[:, 0, :])", train_source)
+        self.assertIn("output_hidden_states=True", train_source)
+        self.assertIn(
+            "self.layer_pooler(outputs.hidden_states)",
+            train_source,
+        )
         self.assertIn("F.cross_entropy", train_source)
         self.assertIn('"t1_yes": T1_THRESHOLD', train_source)
         self.assertIn('"t3_yes": T3_THRESHOLD', train_source)
@@ -272,12 +307,13 @@ class SimplifiedCKIPNotebookTests(unittest.TestCase):
         self.assertIn("weight=class_weights[task]", train_source)
         self.assertIn('"ensemble_members": [', train_source)
         self.assertIn("ensemble_probabilities", inference_source)
-        self.assertIn("only supports simplified artifact v8", inference_source)
+        self.assertIn("only supports simplified artifact v9", inference_source)
 
     def test_long_training_uses_differential_learning_rates(self):
         source = builder.TRAIN_CONFIG + builder.TRAIN_CLASSIFIER
-        self.assertIn("MLM_EPOCHS = 6", source)
+        self.assertIn("MLM_EPOCHS = 10", source)
         self.assertIn("MLM_LR = 3e-5", source)
+        self.assertIn("RUN_HF_UPLOAD = False", source)
         self.assertIn("MAX_EPOCHS = 30", source)
         self.assertIn("EARLY_STOPPING_PATIENCE = 5", source)
         self.assertIn("LORA_LEARNING_RATE = 5e-5", source)
@@ -286,17 +322,142 @@ class SimplifiedCKIPNotebookTests(unittest.TestCase):
         self.assertIn('"lora_learning_rate": current_lrs[0]', source)
         self.assertIn('"head_learning_rate": current_lrs[1]', source)
 
-    def test_cls_head_matches_inference(self):
+    def test_residual_head_matches_inference(self):
         train_source = builder.TRAIN_CLASSIFIER
         inference_source = builder.INFERENCE_MAIN
         expected = [
-            "nn.Linear(hidden_size, 256)",
-            "nn.Linear(256, 128)",
-            "self.shared_mlp(hidden[:, 0, :])",
+            "LearnableLayerPool(num_layers=4)",
+            "nn.Linear(hidden_size, 512)",
+            "ResidualAdapter(512, 256)",
+            "ResidualAdapter(512, 128)",
+            "nn.Linear(512, num_classes)",
+            "nn.init.zeros_(self.up.weight)",
+            "output_hidden_states=True",
+            "self.layer_pooler(outputs.hidden_states)",
         ]
         for token in expected:
             self.assertIn(token, train_source)
             self.assertIn(token, inference_source)
+
+    def test_last_four_cls_pool_starts_as_equal_average(self):
+        components = load_model_components(builder.TRAIN_CLASSIFIER)
+        pooler = components["LearnableLayerPool"](num_layers=4)
+        hidden_states = [
+            torch.randn(2, 3, 8)
+            for _ in range(6)
+        ]
+        actual = pooler(hidden_states)
+        expected = torch.stack(
+            [layer[:, 0, :] for layer in hidden_states[-4:]],
+            dim=0,
+        ).mean(dim=0)
+        self.assertTrue(torch.allclose(actual, expected))
+        self.assertTrue(
+            torch.allclose(
+                torch.softmax(pooler.layer_logits, dim=0),
+                torch.full((4,), 0.25),
+            )
+        )
+
+    def test_shared_and_task_heads_have_expected_shapes(self):
+        components = load_model_components(builder.TRAIN_CLASSIFIER)
+        adapter = components["ResidualAdapter"](
+            feature_size=16,
+            bottleneck_size=4,
+        )
+        adapter_input = torch.randn(3, 16)
+        self.assertTrue(torch.equal(adapter(adapter_input), adapter_input))
+        self.assertTrue(
+            torch.count_nonzero(adapter.up.weight).item() == 0
+        )
+        self.assertTrue(
+            torch.count_nonzero(adapter.up.bias).item() == 0
+        )
+
+        shared = components["SharedFeatureMLP"](hidden_size=768)
+        heads = {
+            task: components["TaskHead"](num_classes)
+            for task, num_classes in {
+                "t1": 2,
+                "t2": 4,
+                "t3": 2,
+                "t4": 3,
+            }.items()
+        }
+        shared.eval()
+        for head in heads.values():
+            head.eval()
+        features = shared(torch.randn(3, 768))
+        self.assertEqual(tuple(features.shape), (3, 512))
+        self.assertTrue(torch.isfinite(features).all())
+        for task, head in heads.items():
+            logits = head(features)
+            self.assertEqual(
+                tuple(logits.shape),
+                (3, head.classifier.out_features),
+                task,
+            )
+            self.assertTrue(torch.isfinite(logits).all(), task)
+            self.assertTrue(
+                torch.count_nonzero(head.adapter.up.weight).item() == 0,
+                task,
+            )
+            self.assertTrue(
+                torch.count_nonzero(head.adapter.up.bias).item() == 0,
+                task,
+            )
+        self.assertTrue(
+            torch.count_nonzero(shared.adapter.up.weight).item() == 0
+        )
+        self.assertTrue(
+            torch.count_nonzero(shared.adapter.up.bias).item() == 0
+        )
+
+    def test_v9_head_checkpoint_matches_inference(self):
+        train = load_model_components(builder.TRAIN_CLASSIFIER)
+        inference = load_model_components(builder.INFERENCE_MAIN)
+
+        def build_state(components):
+            pooler = components["LearnableLayerPool"](num_layers=4)
+            shared = components["SharedFeatureMLP"](hidden_size=768)
+            heads = nn.ModuleDict(
+                {
+                    "t1": components["TaskHead"](2),
+                    "t2": components["TaskHead"](4),
+                    "t3": components["TaskHead"](2),
+                    "t4": components["TaskHead"](3),
+                }
+            )
+            return pooler, shared, heads
+
+        train_modules = build_state(train)
+        state = {
+            "layer_pooler": train_modules[0].state_dict(),
+            "shared_mlp": train_modules[1].state_dict(),
+            "heads": train_modules[2].state_dict(),
+        }
+        buffer = io.BytesIO()
+        torch.save(state, buffer)
+        buffer.seek(0)
+        restored = torch.load(buffer, weights_only=True)
+
+        inference_modules = build_state(inference)
+        inference_modules[0].load_state_dict(restored["layer_pooler"])
+        inference_modules[1].load_state_dict(restored["shared_mlp"])
+        inference_modules[2].load_state_dict(restored["heads"])
+
+        for train_module, inference_module in zip(
+            train_modules,
+            inference_modules,
+        ):
+            train_state = train_module.state_dict()
+            inference_state = inference_module.state_dict()
+            self.assertEqual(train_state.keys(), inference_state.keys())
+            for key in train_state:
+                self.assertTrue(
+                    torch.equal(train_state[key], inference_state[key]),
+                    key,
+                )
 
     def test_checkpoint_uses_competition_score_weights(self):
         source = builder.TRAIN_CONFIG + builder.TRAIN_CLASSIFIER

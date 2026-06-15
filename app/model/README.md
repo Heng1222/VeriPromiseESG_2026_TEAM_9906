@@ -35,7 +35,7 @@ MLM settings:
 - Maximum length: 512
 - Overflow overlap: 64 tokens
 - Dynamic masking: 15%
-- Epochs: 6
+- Epochs: 10
 - Batch size: 4
 - Gradient accumulation: 4
 - Learning rate: `3e-5`
@@ -64,10 +64,19 @@ pairing, holdout, loss, or routing rule.
 ```text
 ESG MLM backbone
   -> LoRA
-  -> CLS representation
-  -> shared MLP: hidden_size -> 256
-  -> four task heads: 256 -> 128 -> output
+  -> learnable weighted average of the last four CLS representations
+  -> shared MLP: LayerNorm(768) -> 512
+  -> shared residual adapter: 512 -> 256 -> 512
+  -> four residual task adapters: 512 -> 128 -> 512
+  -> LayerNorm(512) -> task output
 ```
+
+The four layer weights use a softmax and start uniformly at `0.25`. Both the
+shared and task adapters use GELU and `0.10` dropout. Their up-projection
+weights and biases start at zero, so each residual branch begins as an
+identity mapping instead of perturbing the pretrained representation.
+LayerNorm is used instead of BatchNorm because classification batches contain
+only eight samples.
 
 Each task uses weighted cross-entropy. Every fold derives its weights from its
 own training split:
@@ -122,8 +131,10 @@ mtl_outputs/
 `-- mtl_inference_config.json
 ```
 
-Artifact v8 restores the smaller CLS-only head after the dual-pooling v7
-experiment regressed. It is intentionally incompatible with v7 head weights.
+Artifact v9 stores the learnable layer pooler together with the 512-dimensional
+shared MLP and residual task heads. It is intentionally incompatible with v8
+head weights. The upload switch defaults to `RUN_HF_UPLOAD = False`; a newly
+trained artifact must be evaluated before replacing the published model.
 
 ## Inference
 

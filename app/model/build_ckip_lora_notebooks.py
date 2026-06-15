@@ -69,7 +69,7 @@ MLM_STRIDE = 64
 MLM_PROBABILITY = 0.15
 MLM_BATCH_SIZE = 4
 MLM_GRAD_ACCUM_STEPS = 4
-MLM_EPOCHS = 6
+MLM_EPOCHS = 10
 MLM_LR = 3e-5
 
 MAX_LEN = 512
@@ -503,6 +503,69 @@ def make_lora_config():
     )
 
 
+class LearnableLayerPool(nn.Module):
+    def __init__(self, num_layers=4):
+        super().__init__()
+        self.num_layers = num_layers
+        self.layer_logits = nn.Parameter(torch.zeros(num_layers))
+
+    def forward(self, hidden_states):
+        if len(hidden_states) < self.num_layers:
+            raise ValueError(
+                f"Expected at least {self.num_layers} hidden states, "
+                f"received {len(hidden_states)}."
+            )
+        cls_layers = torch.stack(
+            [layer[:, 0, :] for layer in hidden_states[-self.num_layers:]],
+            dim=0,
+        )
+        weights = torch.softmax(self.layer_logits, dim=0)
+        return (weights[:, None, None] * cls_layers).sum(dim=0)
+
+
+class ResidualAdapter(nn.Module):
+    def __init__(self, feature_size, bottleneck_size, dropout=0.10):
+        super().__init__()
+        self.down = nn.Linear(feature_size, bottleneck_size)
+        self.activation = nn.GELU()
+        self.dropout = nn.Dropout(dropout)
+        self.up = nn.Linear(bottleneck_size, feature_size)
+        nn.init.zeros_(self.up.weight)
+        nn.init.zeros_(self.up.bias)
+
+    def forward(self, features):
+        residual = self.up(
+            self.dropout(self.activation(self.down(features)))
+        )
+        return features + residual
+
+
+class SharedFeatureMLP(nn.Module):
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.input_norm = nn.LayerNorm(hidden_size)
+        self.projection = nn.Linear(hidden_size, 512)
+        self.adapter = ResidualAdapter(512, 256)
+        self.output_norm = nn.LayerNorm(512)
+
+    def forward(self, features):
+        features = self.projection(self.input_norm(features))
+        return self.output_norm(self.adapter(features))
+
+
+class TaskHead(nn.Module):
+    def __init__(self, num_classes):
+        super().__init__()
+        self.adapter = ResidualAdapter(512, 128)
+        self.output_norm = nn.LayerNorm(512)
+        self.classifier = nn.Linear(512, num_classes)
+
+    def forward(self, features):
+        return self.classifier(
+            self.output_norm(self.adapter(features))
+        )
+
+
 class SimpleESGModel(nn.Module):
     def __init__(
         self,
@@ -521,31 +584,24 @@ class SimpleESGModel(nn.Module):
                 is_trainable=is_trainable,
             )
         hidden_size = base_model.config.hidden_size
-        self.shared_mlp = nn.Sequential(
-            nn.Linear(hidden_size, 256),
-            nn.LayerNorm(256),
-            nn.GELU(),
-            nn.Dropout(0.10),
-        )
+        self.layer_pooler = LearnableLayerPool(num_layers=4)
+        self.shared_mlp = SharedFeatureMLP(hidden_size)
         self.heads = nn.ModuleDict(
             {
-                task: nn.Sequential(
-                    nn.Linear(256, 128),
-                    nn.GELU(),
-                    nn.Dropout(0.10),
-                    nn.Linear(128, len(labels)),
-                )
+                task: TaskHead(len(labels))
                 for task, labels in TASK_CLASSES.items()
             }
         )
 
     def forward(self, input_ids, attention_mask):
-        hidden = self.backbone(
+        outputs = self.backbone(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            output_hidden_states=True,
             return_dict=True,
-        ).last_hidden_state
-        features = self.shared_mlp(hidden[:, 0, :])
+        )
+        pooled = self.layer_pooler(outputs.hidden_states)
+        features = self.shared_mlp(pooled)
         return {
             task: head(features)
             for task, head in self.heads.items()
@@ -553,11 +609,13 @@ class SimpleESGModel(nn.Module):
 
     def head_state_dict(self):
         return {
+            "layer_pooler": self.layer_pooler.state_dict(),
             "shared_mlp": self.shared_mlp.state_dict(),
             "heads": self.heads.state_dict(),
         }
 
     def load_heads(self, state):
+        self.layer_pooler.load_state_dict(state["layer_pooler"])
         self.shared_mlp.load_state_dict(state["shared_mlp"])
         self.heads.load_state_dict(state["heads"])
 
@@ -888,7 +946,7 @@ def train_classifier(fold, train_df, val_df, tokenizer):
                 model,
                 fold_dir,
                 {
-                    "artifact_version": 8,
+                    "artifact_version": 9,
                     "fold": fold,
                     "best_epoch": epoch,
                     "best_val_loss": val_loss,
@@ -996,8 +1054,8 @@ TRAIN_ARTIFACT = r'''# ==========================================
 
 def save_inference_config():
     config = {
-        "artifact_version": 8,
-        "model_type": "ckip_bert_mlm_lora_shared_mlp",
+        "artifact_version": 9,
+        "model_type": "ckip_bert_mlm_lora_layer_pool_residual_mlp",
         "model_name": MODEL_NAME,
         "backbone_path": MLM_BACKBONE_DIR.name,
         "ensemble_members": [f"fold_{fold}" for fold in FOLDS],
@@ -1018,11 +1076,19 @@ def save_inference_config():
             "task_aggregation": "equal_mean",
         },
         "architecture": {
-            "pooling": "cls",
-            "shared_mlp": "hidden_size -> 256",
-            "task_heads": "256 -> 128 -> output",
-            "shared_dropout": 0.10,
-            "head_dropout": 0.10,
+            "pooling": "learnable_softmax_last_four_cls",
+            "pooling_initial_weights": [0.25, 0.25, 0.25, 0.25],
+            "shared_mlp": (
+                "LayerNorm(hidden_size) -> hidden_size_to_512 -> "
+                "residual_adapter(512_to_256_to_512) -> LayerNorm(512)"
+            ),
+            "task_heads": (
+                "residual_adapter(512_to_128_to_512) -> "
+                "LayerNorm(512) -> output"
+            ),
+            "adapter_activation": "gelu",
+            "adapter_dropout": 0.10,
+            "adapter_up_projection_init": "zeros",
         },
         "classification_training": {
             "max_epochs": MAX_EPOCHS,
@@ -1126,7 +1192,7 @@ from transformers import AutoModel, AutoTokenizer
 
 
 # ==========================================
-# Simplified five-fold artifact v8 inference
+# Simplified five-fold artifact v9 inference
 # ==========================================
 
 DEFAULT_REPO_ID = "maxbeettww/VeriPromise_ESG_2026_9906"
@@ -1203,8 +1269,8 @@ def load_config(root):
         encoding="utf-8",
     ) as file:
         config = json.load(file)
-    if int(config.get("artifact_version", 0)) != 8:
-        raise ValueError("This notebook only supports simplified artifact v8.")
+    if int(config.get("artifact_version", 0)) != 9:
+        raise ValueError("This notebook only supports simplified artifact v9.")
     return config
 
 
@@ -1252,6 +1318,69 @@ class InferenceDataset(Dataset):
         }
 
 
+class LearnableLayerPool(nn.Module):
+    def __init__(self, num_layers=4):
+        super().__init__()
+        self.num_layers = num_layers
+        self.layer_logits = nn.Parameter(torch.zeros(num_layers))
+
+    def forward(self, hidden_states):
+        if len(hidden_states) < self.num_layers:
+            raise ValueError(
+                f"Expected at least {self.num_layers} hidden states, "
+                f"received {len(hidden_states)}."
+            )
+        cls_layers = torch.stack(
+            [layer[:, 0, :] for layer in hidden_states[-self.num_layers:]],
+            dim=0,
+        )
+        weights = torch.softmax(self.layer_logits, dim=0)
+        return (weights[:, None, None] * cls_layers).sum(dim=0)
+
+
+class ResidualAdapter(nn.Module):
+    def __init__(self, feature_size, bottleneck_size, dropout=0.10):
+        super().__init__()
+        self.down = nn.Linear(feature_size, bottleneck_size)
+        self.activation = nn.GELU()
+        self.dropout = nn.Dropout(dropout)
+        self.up = nn.Linear(bottleneck_size, feature_size)
+        nn.init.zeros_(self.up.weight)
+        nn.init.zeros_(self.up.bias)
+
+    def forward(self, features):
+        residual = self.up(
+            self.dropout(self.activation(self.down(features)))
+        )
+        return features + residual
+
+
+class SharedFeatureMLP(nn.Module):
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.input_norm = nn.LayerNorm(hidden_size)
+        self.projection = nn.Linear(hidden_size, 512)
+        self.adapter = ResidualAdapter(512, 256)
+        self.output_norm = nn.LayerNorm(512)
+
+    def forward(self, features):
+        features = self.projection(self.input_norm(features))
+        return self.output_norm(self.adapter(features))
+
+
+class TaskHead(nn.Module):
+    def __init__(self, num_classes):
+        super().__init__()
+        self.adapter = ResidualAdapter(512, 128)
+        self.output_norm = nn.LayerNorm(512)
+        self.classifier = nn.Linear(512, num_classes)
+
+    def forward(self, features):
+        return self.classifier(
+            self.output_norm(self.adapter(features))
+        )
+
+
 class SimpleESGModel(nn.Module):
     def __init__(self, backbone_path, adapter_dir):
         super().__init__()
@@ -1262,31 +1391,24 @@ class SimpleESGModel(nn.Module):
             is_trainable=False,
         )
         hidden_size = base_model.config.hidden_size
-        self.shared_mlp = nn.Sequential(
-            nn.Linear(hidden_size, 256),
-            nn.LayerNorm(256),
-            nn.GELU(),
-            nn.Dropout(0.10),
-        )
+        self.layer_pooler = LearnableLayerPool(num_layers=4)
+        self.shared_mlp = SharedFeatureMLP(hidden_size)
         self.heads = nn.ModuleDict(
             {
-                task: nn.Sequential(
-                    nn.Linear(256, 128),
-                    nn.GELU(),
-                    nn.Dropout(0.10),
-                    nn.Linear(128, len(labels)),
-                )
+                task: TaskHead(len(labels))
                 for task, labels in TASK_CLASSES.items()
             }
         )
 
     def forward(self, input_ids, attention_mask):
-        hidden = self.backbone(
+        outputs = self.backbone(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            output_hidden_states=True,
             return_dict=True,
-        ).last_hidden_state
-        features = self.shared_mlp(hidden[:, 0, :])
+        )
+        pooled = self.layer_pooler(outputs.hidden_states)
+        features = self.shared_mlp(pooled)
         return {
             task: head(features)
             for task, head in self.heads.items()
@@ -1294,6 +1416,7 @@ class SimpleESGModel(nn.Module):
 
     def load_heads(self, path):
         state = torch.load(path, map_location=DEVICE, weights_only=True)
+        self.layer_pooler.load_state_dict(state["layer_pooler"])
         self.shared_mlp.load_state_dict(state["shared_mlp"])
         self.heads.load_state_dict(state["heads"])
 
@@ -1324,7 +1447,7 @@ def predict_probabilities(model, loader):
 def ensemble_probabilities(root, config, loader):
     members = config.get("ensemble_members", [])
     if len(members) != 5:
-        raise ValueError("Artifact v8 must contain five ensemble members.")
+        raise ValueError("Artifact v9 must contain five ensemble members.")
     accumulated = {task: None for task in TASK_CLASSES}
     for member in members:
         member_dir = Path(root) / member
